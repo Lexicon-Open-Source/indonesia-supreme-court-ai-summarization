@@ -1,0 +1,19 @@
+version: '3.5'
+
+services:
+  court-decision-summarizer:
+    depends_on:
+      - nats
+    build:
+      context: ./
+      args:
+        - SERVICE_PORT=8080
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+  nats:
+    image: nats
+    ports:
+      - "4222:4222"
+    command: -js
