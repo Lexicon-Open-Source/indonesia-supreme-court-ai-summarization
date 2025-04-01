@@ -22,10 +22,18 @@ RUN chmod 600 /etc/google/auth/lexicon-bo-crawler-service-account.json
 
 COPY . .
 
-# Configure PyTorch index
-RUN uv config set torch.index https://download.pytorch.org/whl/cpu
+# Make entrypoint executable
+RUN chmod u+x entrypoint.sh
 
-RUN chmod u+x entrypoint.sh && uv sync
+# Install PyTorch CPU version first
+RUN pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cpu
+
+# Install other dependencies without using torch from pyproject.toml
+RUN uv pip install --system -e . --no-deps && \
+    uv pip install --system aiofiles>=24.1.0 asyncpg>=0.30.0 "fastapi[standard]>=0.115.0" \
+    google-cloud-storage>=2.14.0 litellm>=1.52.9 markdown>=3.7 nats-py>=2.9.0 \
+    openai>=1.39.0 pydantic-settings>=2.5.2 sqlmodel>=0.0.22 \
+    tenacity>=9.0.0 typer>=0.12.5 "unstructured[pdf]>=0.16.5"
 
 ARG SERVICE_PORT
 ENV SERVICE_PORT=${SERVICE_PORT}
