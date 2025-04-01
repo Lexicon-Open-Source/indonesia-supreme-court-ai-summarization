@@ -1,0 +1,20 @@
+db:
+  host:
+  port:
+  user:
+  password:
+  sslmode: disable
+
+nats:
+  url: nats://
+  streamname: SUPREME_COURT_SUMMARIZATION_EVENT
+  subject: SUPREME_COURT_SUMMARIZATION_EVENT.summarize
+
+# Number of extraction IDs to process per batch
+batchsize: 10
+
+# Interval in seconds between batch processing (5 minutes)
+interval: 300
+
+# Logging level (debug, info, warn, error)
+loglevel: debug
