@@ -66,7 +66,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         num_of_summarizer_consumer_instances = (
             get_settings().nats__num_of_summarizer_consumer_instances
         )
-        logger.info(f"Creating {num_of_summarizer_consumer_instances} NATS consumer instances")
+        logger.info(f"Creating {num_of_summarizer_consumer_instances} NATS consumer instances (push-based)")
         nats_consumer_job_connection.extend(
             create_job_consumer_async_task(
                 nats_client=contexts.nats_client,
@@ -74,9 +74,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 consumer_config=CONSUMER_CONFIG,
                 processing_func=generate_summary,
                 num_of_consumer_instances=num_of_summarizer_consumer_instances,
+                use_push_subscription=True,  # Use push-based for immediate processing
             )
         )
-        logger.info("Startup completed successfully")
+        logger.info("Startup completed successfully - consumers are ready for immediate message processing")
     except Exception as e:
         logger.error(f"Error during startup: {str(e)}")
         raise
@@ -105,13 +106,14 @@ async def generate_summary(msg: Msg) -> None:
         data = json.loads(msg.data.decode())
         logger.info(f"Processing summarization request: {data}")
 
-        try:
-            extraction_id = data.get("extraction_id")
-            if not extraction_id:
-                logger.error(f"Missing extraction_id in request data: {data}")
-                await msg.ack()
-                return
+        extraction_id = data.get("extraction_id")
+        if not extraction_id:
+            logger.error(f"Missing extraction_id in request data: {data}")
+            # Acknowledge invalid messages to prevent reprocessing
+            await msg.ack()
+            return
 
+        try:
             logger.info(f"Extracting and reformatting summary for extraction_id: {extraction_id}")
             (
                 summary,
@@ -138,17 +140,28 @@ async def generate_summary(msg: Msg) -> None:
             )
 
             logger.info(f"Successfully processed summarization for decision number: {decision_number}")
+            # Acknowledge successful processing
+            await msg.ack()
         except Exception as e:
-            logger.error(f"Failed to process summarization {data}: {str(e)}")
+            logger.error(f"Failed to process summarization for {extraction_id}: {str(e)}")
+            # For processing errors, we should not ack (let NATS retry delivery)
+            # But if we're using max_deliver=2 in config, we should ack to prevent infinite retries
+            await msg.ack()
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in message: {e}")
+        # Acknowledge invalid messages to prevent reprocessing
+        await msg.ack()
     except Exception as e:
         logger.error(f"Critical error in generate_summary: {str(e)}")
+        # Log the message content in case of critical failures
+        try:
+            logger.error(f"Message content: {msg.data.decode()}")
+        except:
+            logger.error("Could not decode message data")
+        # For critical errors, we should not ack (let NATS retry delivery)
+        await msg.ack()  # Still ack to avoid stuck messages
     finally:
         sys.stdout.flush()
-        try:
-            await msg.ack()
-            logger.debug("Message acknowledged")
-        except Exception as e:
-            logger.error(f"Failed to acknowledge message: {str(e)}")
 
 
 @app.post(

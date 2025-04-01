@@ -1,6 +1,9 @@
 import asyncio
 import tempfile
 import logging
+import re
+import os
+from urllib.parse import urlparse
 
 import aiofiles
 from httpx import AsyncClient
@@ -18,6 +21,14 @@ from unstructured.documents.elements import Footer, Header
 from unstructured.partition.pdf import partition_pdf
 
 from settings import get_settings
+
+# Add imports for Google Cloud Storage, if available
+try:
+    from google.cloud import storage
+    from google.auth.exceptions import DefaultCredentialsError
+    HAS_GCS = True
+except ImportError:
+    HAS_GCS = False
 
 
 class Extraction(SQLModel, table=True):
@@ -105,6 +116,121 @@ async def get_extraction_db_data_and_validate(
         raise
 
 
+def is_gcs_url(url: str) -> bool:
+    """
+    Check if a URL is from Google Cloud Storage.
+
+    Args:
+        url: The URL to check
+
+    Returns:
+        bool: True if the URL is from Google Cloud Storage, False otherwise
+    """
+    try:
+        parsed_url = urlparse(url)
+        return parsed_url.netloc == "storage.googleapis.com" and parsed_url.scheme in ["http", "https"]
+    except Exception as e:
+        logging.error(f"Error parsing URL {url}: {str(e)}")
+        return False
+
+
+async def download_from_gcs(uri_path: str, local_path: str) -> None:
+    """
+    Download a file from Google Cloud Storage.
+
+    Args:
+        uri_path: The GCS URL
+        local_path: Local path to save the file
+
+    Raises:
+        ValueError: If failed to download the file
+    """
+    logging.info(f"Downloading from GCS: {uri_path}")
+
+    if not HAS_GCS:
+        logging.error("Google Cloud Storage libraries are not installed")
+        raise ValueError("Google Cloud Storage libraries are not installed. Please install 'google-cloud-storage'")
+
+    try:
+        # Extract bucket and blob path from the URL
+        # Format: https://storage.googleapis.com/bucket-name/path/to/file
+        parsed_url = urlparse(uri_path)
+        path_parts = parsed_url.path.lstrip('/').split('/', 1)
+
+        if len(path_parts) != 2:
+            raise ValueError(f"Invalid GCS URL format: {uri_path}")
+
+        bucket_name = path_parts[0]
+        blob_name = path_parts[1]
+
+        logging.debug(f"Extracted bucket: {bucket_name}, blob: {blob_name}")
+
+        # Initialize storage client with retries
+        max_retries = 3
+        retry_delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                storage_client = storage.Client()
+                break
+            except DefaultCredentialsError:
+                if attempt == max_retries - 1:
+                    logging.warning("No GCP credentials found, trying anonymous access")
+                    storage_client = storage.Client.create_anonymous_client()
+                else:
+                    logging.warning(f"Failed to initialize storage client, attempt {attempt + 1}/{max_retries}")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+
+        # Get bucket and blob with timeout
+        try:
+            bucket = storage_client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+
+            # Check if blob exists
+            if not blob.exists():
+                raise ValueError(f"Blob {blob_name} does not exist in bucket {bucket_name}")
+
+            # Download to file with timeout
+            blob.download_to_filename(local_path, timeout=30)
+            logging.info(f"Successfully downloaded from GCS to {local_path}")
+
+        except Exception as e:
+            logging.error(f"Error accessing GCS bucket/blob: {str(e)}")
+            raise
+
+    except Exception as e:
+        logging.error(f"Error downloading from GCS: {str(e)}")
+        # If GCS access failed, try via signed URL
+        try:
+            logging.info("Attempting to access via public URL")
+            async with AsyncClient(timeout=get_settings().async_http_request_timeout) as client:
+                # Try with a different user agent to avoid potential filtering
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                    "Accept": "application/pdf,*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Connection": "keep-alive"
+                }
+                response = await client.get(uri_path, headers=headers, follow_redirects=True)
+                if response.status_code != 200:
+                    raise ValueError(f"Failed to download from public URL: HTTP {response.status_code}, Response: {response.text}")
+
+                # Verify content type
+                content_type = response.headers.get("content-type", "")
+                if not content_type.startswith("application/pdf"):
+                    logging.warning(f"Unexpected content type: {content_type} for URL: {uri_path}")
+
+                async with aiofiles.open(local_path, "wb") as afp:
+                    await afp.write(response.content)
+                    await afp.flush()
+
+                logging.info(f"Successfully downloaded via public URL to {local_path}")
+        except Exception as inner_e:
+            logging.error(f"Error accessing via public URL: {str(inner_e)}")
+            raise ValueError(f"Failed to download from GCS: {str(e)}, and public URL access failed: {str(inner_e)}")
+
+
 @retry(
     wait=wait_exponential(multiplier=1, min=4, max=10),
     stop=stop_after_attempt(5),
@@ -114,24 +240,56 @@ async def read_pdf_from_uri(uri_path: str) -> tuple[dict[int, str], int]:
     logging.info(f"Reading PDF from URI: {uri_path}")
     try:
         logging.debug(f"Downloading file from {uri_path}")
-        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
             try:
-                async with AsyncClient(
-                    timeout=get_settings().async_http_request_timeout
-                ) as client:
-                    logging.debug(f"Sending HTTP request to {uri_path}")
-                    response = await client.get(uri_path)
-                    if response.status_code != 200:
-                        logging.error(f"Failed to download PDF, status code: {response.status_code}")
-                        raise ValueError(f"Failed to download PDF: HTTP {response.status_code}")
+                # Check if this is a GCS URL
+                if is_gcs_url(uri_path):
+                    logging.info(f"Detected Google Cloud Storage URL: {uri_path}")
+                    await download_from_gcs(uri_path, temp_file.name)
+                else:
+                    # Standard HTTP download
+                    async with AsyncClient(
+                        timeout=get_settings().async_http_request_timeout,
+                        follow_redirects=True
+                    ) as client:
+                        logging.debug(f"Sending HTTP request to {uri_path}")
+                        # Add user-agent to avoid potential filtering
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                            "Accept": "application/pdf,*/*",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Connection": "keep-alive"
+                        }
+                        response = await client.get(uri_path, headers=headers)
+                        if response.status_code != 200:
+                            logging.error(f"Failed to download PDF, status code: {response.status_code}, response: {response.text}")
+                            raise ValueError(f"Failed to download PDF: HTTP {response.status_code}")
 
-                logging.debug(f"Writing response content to temporary file: {temp_file.name}")
-                async with aiofiles.open(temp_file.name, "wb") as afp:
-                    await afp.write(response.content)
-                    await afp.flush()
+                        # Verify content type
+                        content_type = response.headers.get("content-type", "")
+                        if not content_type.startswith("application/pdf"):
+                            logging.warning(f"Unexpected content type: {content_type} for URL: {uri_path}")
 
-                logging.debug("Partitioning PDF file")
-                elements = partition_pdf(temp_file.name)
+                        logging.debug(f"Writing response content to temporary file: {temp_file.name}")
+                        async with aiofiles.open(temp_file.name, "wb") as afp:
+                            await afp.write(response.content)
+                            await afp.flush()
+
+                # Verify file exists and has content
+                if not os.path.exists(temp_file.name):
+                    raise ValueError(f"Temporary file {temp_file.name} was not created")
+
+                if os.path.getsize(temp_file.name) == 0:
+                    raise ValueError(f"Temporary file {temp_file.name} is empty")
+
+                logging.debug(f"Partitioning PDF file from {temp_file.name}")
+                try:
+                    elements = partition_pdf(temp_file.name)
+                    if not elements:
+                        raise ValueError("No elements found in PDF file")
+                except Exception as e:
+                    logging.error(f"Failed to partition PDF: {str(e)}")
+                    raise ValueError(f"Failed to parse PDF file: {str(e)}")
             except Exception as e:
                 logging.error(f"Error processing PDF file: {str(e)}")
                 raise
@@ -149,6 +307,9 @@ async def read_pdf_from_uri(uri_path: str) -> tuple[dict[int, str], int]:
             contents[current_page] = current_content
 
             await asyncio.sleep(0.01)
+
+        if not contents:
+            raise ValueError("No content extracted from PDF")
 
         max_page = current_page
         logging.info(f"Successfully extracted {len(contents)} pages from PDF, max page: {max_page}")

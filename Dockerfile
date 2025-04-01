@@ -7,10 +7,18 @@ WORKDIR $PYSETUP_PATH
 
 RUN apt-get update && \
     apt-get install --no-install-recommends -y build-essential \
-    clang curl libgl1 libglib2.0-0 poppler-utils tesseract-ocr && \
+    clang curl libgl1 libglib2.0-0 poppler-utils tesseract-ocr ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     curl -LsSf https://astral.sh/uv/0.4.29/install.sh | sh && \
     uv python install 3.10
+
+# Create credentials directory and set permissions
+RUN mkdir -p /etc/google/auth && \
+    chmod 700 /etc/google/auth
+
+# Copy service account file
+COPY lexicon-bo-crawler-service-account.json /etc/google/auth/
+RUN chmod 600 /etc/google/auth/lexicon-bo-crawler-service-account.json
 
 COPY . .
 RUN chmod u+x entrypoint.sh && uv sync
