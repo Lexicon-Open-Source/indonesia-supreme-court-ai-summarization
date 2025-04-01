@@ -21,6 +21,10 @@ COPY lexicon-bo-crawler-service-account.json /etc/google/auth/
 RUN chmod 600 /etc/google/auth/lexicon-bo-crawler-service-account.json
 
 COPY . .
+
+# Configure PyTorch index
+RUN uv config set torch.index https://download.pytorch.org/whl/cpu
+
 RUN chmod u+x entrypoint.sh && uv sync
 
 ARG SERVICE_PORT
