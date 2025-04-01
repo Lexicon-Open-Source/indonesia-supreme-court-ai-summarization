@@ -7,7 +7,7 @@ WORKDIR $PYSETUP_PATH
 
 RUN apt-get update && \
     apt-get install --no-install-recommends -y build-essential \
-            clang curl libgl1 libglib2.0-0 && \
+    clang curl libgl1 libglib2.0-0 poppler-utils tesseract-ocr && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     curl -LsSf https://astral.sh/uv/0.4.29/install.sh | sh && \
     uv python install 3.10
