@@ -26,7 +26,6 @@ CONSUMER_CONFIG = ConsumerConfig(
     ack_wait=DEFAULT_WAIT_TIME_PER_PROCESS,
     max_deliver=2,
     max_ack_pending=3,
-    idle_heartbeat=5.0,
 )
 STREAM_CONFIG = StreamConfig(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
 
