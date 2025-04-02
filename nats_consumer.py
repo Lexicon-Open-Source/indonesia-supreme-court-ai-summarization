@@ -29,6 +29,7 @@ CONSUMER_CONFIG = ConsumerConfig(
     deliver_group=f"{DURABLE_NAME}_QUEUE",
     deliver_subject=f"{DURABLE_NAME}.PUSH",
     flow_control=True,
+    idle_heartbeat=5.0,  # Add 5-second heartbeat for flow control
 )
 STREAM_CONFIG = StreamConfig(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
 
