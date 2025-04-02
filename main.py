@@ -31,9 +31,9 @@ from settings import get_settings
 from src.io import write_summary_to_db
 from src.summarization import extract_and_reformat_summary, sanitize_markdown_symbol
 
-# Configure logging
+# Configure logging - CHANGED TO DEBUG
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed from INFO to DEBUG
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
@@ -61,7 +61,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     logger.info("Starting up summarization API")
     nats_consumer_job_connection = []
     try:
+        logger.debug("About to get app contexts...")
         contexts = await CONTEXTS.get_app_contexts()
+        logger.debug(f"NATS URL from settings: {get_settings().nats__url}")
 
         # Ensure stream exists before creating consumers
         try:
@@ -72,20 +74,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         except Exception as e:
             if "already exists" not in str(e):
                 logger.warning(f"Stream creation warning: {e}")
+            else:
+                logger.info(f"Stream {STREAM_NAME} already exists")
+
+        # Add explicit check for NATS connection
+        if not contexts.nats_client.is_connected:
+            logger.error("NATS client is not connected!")
+        else:
+            logger.debug("NATS client is connected")
 
         num_of_summarizer_consumer_instances = (
             get_settings().nats__num_of_summarizer_consumer_instances
         )
-        logger.info(f"Creating {num_of_summarizer_consumer_instances} NATS consumer instances (push-based)")
-        nats_consumer_job_connection.extend(
-            create_job_consumer_async_task(
+        logger.info(f"Creating {num_of_summarizer_consumer_instances} NATS consumer instances (pull-based)")
+
+        # More detailed logging for task creation
+        try:
+            consumer_tasks = create_job_consumer_async_task(
                 nats_client=contexts.nats_client,
                 jetstream_client=contexts.jetstream_client,
                 consumer_config=CONSUMER_CONFIG,
                 processing_func=generate_summary,
                 num_of_consumer_instances=num_of_summarizer_consumer_instances,
             )
-        )
+            logger.debug(f"Created {len(consumer_tasks)} consumer tasks")
+            nats_consumer_job_connection.extend(consumer_tasks)
+
+            # Add task status check
+            for i, task in enumerate(consumer_tasks):
+                logger.debug(f"Consumer task {i+1} status: done={task.done()}, cancelled={task.cancelled()}")
+
+        except Exception as consumer_ex:
+            logger.error(f"Error creating consumer tasks: {str(consumer_ex)}")
+
         logger.info("Startup completed successfully - consumers are ready for immediate message processing")
     except Exception as e:
         logger.error(f"Error during startup: {str(e)}")
@@ -197,6 +218,12 @@ async def submit_summarization_job(
             )
 
         nats_client: NATS = app_contexts.nats_client
+        if not nats_client.is_connected:
+            logger.warning("NATS client is not connected, reconnecting...")
+            # Likely a reconnection will happen in get_app_contexts with init_nats=True
+            app_contexts = await CONTEXTS.get_app_contexts(init_nats=True)
+            nats_client = app_contexts.nats_client
+
         js = nats_client.jetstream()
 
         logger.debug(f"Adding stream {STREAM_NAME} with subjects {STREAM_SUBJECTS}")
@@ -206,12 +233,25 @@ async def submit_summarization_job(
                 subjects=[STREAM_SUBJECTS],
             )
         except Exception as e:
-            logger.warning(f"Stream may already exist: {str(e)}")
-            # Stream might already exist, continue
+            if "already exists" not in str(e):
+                logger.warning(f"Stream creation warning: {e}")
+            else:
+                logger.debug(f"Stream {STREAM_NAME} already exists")
+
+        # Convert to JSON and check the message before publishing
+        json_payload = payload.model_dump_json()
+        logger.debug(f"Message to publish: {json_payload}")
 
         logger.info(f"Publishing summarization job for extraction_id: {extraction_id}")
-        ack = await js.publish(SUBJECT, payload.model_dump_json().encode())
+        ack = await js.publish(SUBJECT, json_payload.encode())
         logger.info(f"Successfully submitted summarization job: {payload}, ack: {ack}")
+
+        # Verify the stream stats after publishing
+        try:
+            stream_info = await js.stream_info(STREAM_NAME)
+            logger.debug(f"Stream stats after publish: messages={stream_info.state.messages}, consumers={len(stream_info.state.consumer_count)}")
+        except Exception as e:
+            logger.warning(f"Could not get stream stats: {e}")
 
     except Exception as e:
         err_msg = f"Error processing summarization: {str(e)}; RECEIVED DATA: {payload}"
