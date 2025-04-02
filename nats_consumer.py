@@ -26,10 +26,7 @@ CONSUMER_CONFIG = ConsumerConfig(
     ack_wait=DEFAULT_WAIT_TIME_PER_PROCESS,
     max_deliver=2,
     max_ack_pending=3,
-    deliver_group=f"{DURABLE_NAME}_QUEUE",
-    deliver_subject=f"{DURABLE_NAME}.PUSH",
-    flow_control=True,
-    idle_heartbeat=5.0,  # Add 5-second heartbeat for flow control
+    idle_heartbeat=5.0,
 )
 STREAM_CONFIG = StreamConfig(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
 
@@ -136,7 +133,7 @@ def create_job_consumer_async_task(
     consumer_config: ConsumerConfig,
     processing_func: Callable,
     num_of_consumer_instances: int = 1,
-    use_push_subscription: bool = True,  # Default to push-based subscription
+    use_push_subscription: bool = True,  # Default is now ignored, we always use pull
 ) -> list[asyncio.Task]:
     """
     Asynchronously creates multiple job consumer tasks.
@@ -151,7 +148,7 @@ def create_job_consumer_async_task(
         num_of_consumer_instances (int):
             The number of consumer instances to create.
         use_push_subscription (bool):
-            Whether to use push-based subscription (True) or pull-based (False).
+            Legacy parameter, now ignored as we always use pull-based subscription.
 
     Returns:
         List[asyncio.Task]:
@@ -159,125 +156,28 @@ def create_job_consumer_async_task(
     """
     nats_consumer_job_connection = []
     for _ in range(num_of_consumer_instances):
-        if use_push_subscription:
-            nats_consumer_job_connection.append(
-                asyncio.create_task(
-                    run_push_job_consumer(
-                        nats_client=nats_client,
-                        jetstream_client=jetstream_client,
-                        consumer_config=consumer_config,
-                        processing_func=processing_func,
-                    )
-                ),
-            )
-        else:
-            nats_consumer_job_connection.append(
-                asyncio.create_task(
-                    run_job_consumer(
-                        nats_client=nats_client,
-                        jetstream_client=jetstream_client,
-                        consumer_config=consumer_config,
-                        processing_func=processing_func,
-                    )
-                ),
-            )
+        nats_consumer_job_connection.append(
+            asyncio.create_task(
+                run_pull_job_consumer_improved(
+                    nats_client=nats_client,
+                    jetstream_client=jetstream_client,
+                    consumer_config=consumer_config,
+                    processing_func=processing_func,
+                )
+            ),
+        )
 
     return nats_consumer_job_connection
 
 
-async def run_job_consumer(
-    nats_client: NATS,
-    jetstream_client: JetStreamContext,
-    consumer_config: ConsumerConfig,
-    processing_func: Callable,
-    fetch_job_batch_size: int = 10,
-    wait_time_for_next_fetch: float = DEFAULT_WAIT_TIME_FOR_NEXT_FETCH,
-) -> None:
-    """
-    Run the job consumer to process messages.
-
-    Args:
-        nats_client (NATS): NATS client.
-        jetstream_client (JetStreamContext): JetStream context
-        consumer_config (ConsumerConfig): The configuration for the consumer.
-        processing_func (callable): The function to be executed for each job.
-        fetch_job_batch_size (int): Number of messages to fetch in a batch.
-        wait_time_for_next_fetch (float): Time to wait between fetches.
-
-    Returns:
-        None
-    """
-    job_consumer = await create_pull_job_consumer(jetstream_client, consumer_config)
-
-    while True:
-        try:
-            if not nats_client.is_connected:
-                nats_client = await initialize_nats()
-
-                stream_configs = generate_nats_stream_configs()
-                jetstream_client = await initialize_jetstream_client(
-                    nats_client=nats_client,
-                    stream_configs=stream_configs,
-                )
-
-                job_consumer = await create_pull_job_consumer(
-                    jetstream_client, consumer_config
-                )
-
-            msgs = await job_consumer.fetch(fetch_job_batch_size)
-            if msgs:
-                # Process messages concurrently
-                await asyncio.gather(*[processing_func(msg) for msg in msgs])
-            else:
-                # No messages, small wait to avoid CPU spin
-                await asyncio.sleep(0.01)
-
-        except asyncio.TimeoutError:
-            # Just continue to next iteration with minimal delay
-            continue
-
-        except Exception as e:
-            logging.warning(f"Unknown err: {e}")
-            await asyncio.sleep(1)  # Shorter retry delay on errors
-
-
-async def create_pull_job_consumer(
-    jetstream_client: JetStreamContext,
-    consumer_config: ConsumerConfig,
-) -> JetStreamContext.PullSubscription:
-    """
-    Initialize the job stream client and consumer.
-
-    Args:
-        jetstream_client (JetStreamContext):
-            The JetStream client.
-        consumer_config (ConsumerConfig):
-            The consumer configuration.
-
-    Returns:
-        JetStreamContext.PullSubscription:
-            A JobConsumer representing the pull subscription.
-    """
-    job_consumer = await jetstream_client.pull_subscribe(
-        subject=consumer_config.filter_subject,
-        durable=consumer_config.durable_name,
-        config=consumer_config,
-        pending_msgs_limit=PENDING_MSG_LIMIT,
-    )
-    print(f"Running {consumer_config.filter_subject} job subscriber..")
-    sys.stdout.flush()
-
-    return job_consumer
-
-
-async def run_push_job_consumer(
+async def run_pull_job_consumer_improved(
     nats_client: NATS,
     jetstream_client: JetStreamContext,
     consumer_config: ConsumerConfig,
     processing_func: Callable,
 ) -> None:
     """
-    Run a push-based job consumer for immediate message processing.
+    Run a pull-based job consumer for reliable message processing.
 
     Args:
         nats_client (NATS): NATS client.
@@ -288,9 +188,6 @@ async def run_push_job_consumer(
     Returns:
         None
     """
-    # Use a queue group to load balance across multiple subscribers
-    queue_group = consumer_config.deliver_group
-
     # Handle message callback
     async def message_handler(msg):
         try:
@@ -321,46 +218,32 @@ async def run_push_job_consumer(
                     stream_configs=stream_configs,
                 )
 
-            # First, try to delete existing consumer if it exists
-            try:
-                await jetstream_client.delete_consumer(STREAM_NAME, consumer_config.durable_name)
-                logging.info(f"Deleted existing consumer: {consumer_config.durable_name}")
-            except Exception as e:
-                if "not found" not in str(e).lower():
-                    logging.warning(f"Error deleting consumer: {e}")
-
-            # Explicitly create the consumer before subscribing
-            try:
-                logging.info(f"Creating consumer {consumer_config.durable_name} on stream {STREAM_NAME}")
-                await jetstream_client.add_consumer(
-                    stream=STREAM_NAME,
-                    config=consumer_config
-                )
-                logging.info(f"Consumer {consumer_config.durable_name} created successfully")
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    logging.error(f"Error creating consumer: {e}")
-                    raise
-
-            # Create a JetStream push consumer with a queue for load balancing
-            subscription = await jetstream_client.subscribe(
+            # Instead of messing with consumers, use a simple pull subscription
+            logging.info(f"Creating pull subscriber for {consumer_config.filter_subject}")
+            subscription = await jetstream_client.pull_subscribe(
                 subject=consumer_config.filter_subject,
-                queue=queue_group,
                 durable=consumer_config.durable_name,
-                cb=message_handler,
-                manual_ack=True,  # We'll handle acknowledgment in the processing function
                 config=consumer_config,
             )
 
             # Reset retry count on success
             retry_count = 0
 
-            print(f"Running push-based subscription for {consumer_config.filter_subject}..")
-            sys.stdout.flush()
+            logging.info(f"Running pull-based subscription for {consumer_config.filter_subject}")
 
-            # Keep the subscription active
+            # Process messages in a loop
             while nats_client.is_connected:
-                await asyncio.sleep(1)
+                try:
+                    # Fetch messages in batches
+                    msgs = await subscription.fetch(batch=10, timeout=1)
+                    if msgs:
+                        await asyncio.gather(*[processing_func(msg) for msg in msgs])
+                except asyncio.TimeoutError:
+                    # No messages, continue polling
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logging.error(f"Error processing message batch: {e}")
+                    await asyncio.sleep(1)
 
             # If we get here, the connection was lost
             try:
@@ -373,7 +256,7 @@ async def run_push_job_consumer(
             # Calculate exponential backoff delay (1s, 2s, 4s, 8s, etc.)
             retry_delay = min(base_retry_delay * (2 ** (retry_count - 1)), 30)
 
-            logging.error(f"Push subscription error: {e}, retrying in {retry_delay}s (attempt {retry_count}/{max_retries})")
+            logging.error(f"Subscription error: {e}, retrying in {retry_delay}s (attempt {retry_count}/{max_retries})")
 
             if retry_count >= max_retries:
                 logging.error(f"Reached maximum retry attempts ({max_retries}), waiting longer before next attempt")

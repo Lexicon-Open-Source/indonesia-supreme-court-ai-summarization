@@ -84,7 +84,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 consumer_config=CONSUMER_CONFIG,
                 processing_func=generate_summary,
                 num_of_consumer_instances=num_of_summarizer_consumer_instances,
-                use_push_subscription=True,  # Use push-based for immediate processing
             )
         )
         logger.info("Startup completed successfully - consumers are ready for immediate message processing")
