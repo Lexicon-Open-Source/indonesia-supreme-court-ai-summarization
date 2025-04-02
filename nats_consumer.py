@@ -27,6 +27,8 @@ CONSUMER_CONFIG = ConsumerConfig(
     max_deliver=2,
     max_ack_pending=3,
     deliver_group=f"{DURABLE_NAME}_QUEUE",
+    deliver_subject=f"{DURABLE_NAME}.PUSH",
+    flow_control=True,
 )
 STREAM_CONFIG = StreamConfig(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
 
@@ -301,6 +303,10 @@ async def run_push_job_consumer(
                 logging.error("Failed to NAK message")
 
     # Setup subscription with proper error handling
+    retry_count = 0
+    max_retries = 10
+    base_retry_delay = 1  # Start with 1 second
+
     while True:
         try:
             if not nats_client.is_connected:
@@ -314,6 +320,27 @@ async def run_push_job_consumer(
                     stream_configs=stream_configs,
                 )
 
+            # First, try to delete existing consumer if it exists
+            try:
+                await jetstream_client.delete_consumer(STREAM_NAME, consumer_config.durable_name)
+                logging.info(f"Deleted existing consumer: {consumer_config.durable_name}")
+            except Exception as e:
+                if "not found" not in str(e).lower():
+                    logging.warning(f"Error deleting consumer: {e}")
+
+            # Explicitly create the consumer before subscribing
+            try:
+                logging.info(f"Creating consumer {consumer_config.durable_name} on stream {STREAM_NAME}")
+                await jetstream_client.add_consumer(
+                    stream=STREAM_NAME,
+                    config=consumer_config
+                )
+                logging.info(f"Consumer {consumer_config.durable_name} created successfully")
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    logging.error(f"Error creating consumer: {e}")
+                    raise
+
             # Create a JetStream push consumer with a queue for load balancing
             subscription = await jetstream_client.subscribe(
                 subject=consumer_config.filter_subject,
@@ -323,6 +350,9 @@ async def run_push_job_consumer(
                 manual_ack=True,  # We'll handle acknowledgment in the processing function
                 config=consumer_config,
             )
+
+            # Reset retry count on success
+            retry_count = 0
 
             print(f"Running push-based subscription for {consumer_config.filter_subject}..")
             sys.stdout.flush()
@@ -338,8 +368,18 @@ async def run_push_job_consumer(
                 pass
 
         except Exception as e:
-            logging.error(f"Push subscription error: {e}")
-            await asyncio.sleep(1)  # Brief wait before retry
+            retry_count += 1
+            # Calculate exponential backoff delay (1s, 2s, 4s, 8s, etc.)
+            retry_delay = min(base_retry_delay * (2 ** (retry_count - 1)), 30)
+
+            logging.error(f"Push subscription error: {e}, retrying in {retry_delay}s (attempt {retry_count}/{max_retries})")
+
+            if retry_count >= max_retries:
+                logging.error(f"Reached maximum retry attempts ({max_retries}), waiting longer before next attempt")
+                await asyncio.sleep(60)  # Wait a minute before resetting retry count
+                retry_count = 0
+            else:
+                await asyncio.sleep(retry_delay)  # Exponential backoff
 
 
 async def close_nats_connection(connection_task: asyncio.Task) -> None:
