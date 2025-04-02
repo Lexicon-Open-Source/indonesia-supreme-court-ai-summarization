@@ -26,6 +26,7 @@ CONSUMER_CONFIG = ConsumerConfig(
     ack_wait=DEFAULT_WAIT_TIME_PER_PROCESS,
     max_deliver=2,
     max_ack_pending=3,
+    deliver_group=f"{DURABLE_NAME}_QUEUE",
 )
 STREAM_CONFIG = StreamConfig(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
 
@@ -285,7 +286,7 @@ async def run_push_job_consumer(
         None
     """
     # Use a queue group to load balance across multiple subscribers
-    queue_group = f"{consumer_config.durable_name}_QUEUE"
+    queue_group = consumer_config.deliver_group
 
     # Handle message callback
     async def message_handler(msg):

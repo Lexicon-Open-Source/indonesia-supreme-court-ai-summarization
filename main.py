@@ -63,6 +63,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     try:
         contexts = await CONTEXTS.get_app_contexts()
 
+        # Ensure stream exists before creating consumers
+        try:
+            logger.info(f"Ensuring stream {STREAM_NAME} exists")
+            js = contexts.nats_client.jetstream()
+            await js.add_stream(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
+            logger.info(f"Stream {STREAM_NAME} confirmed")
+        except Exception as e:
+            if "already exists" not in str(e):
+                logger.warning(f"Stream creation warning: {e}")
+
         num_of_summarizer_consumer_instances = (
             get_settings().nats__num_of_summarizer_consumer_instances
         )
