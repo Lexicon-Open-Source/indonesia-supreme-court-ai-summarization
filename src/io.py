@@ -151,6 +151,37 @@ async def download_from_gcs(uri_path: str, local_path: str) -> None:
         logging.error("Google Cloud Storage libraries are not installed")
         raise ValueError("Google Cloud Storage libraries are not installed. Please install 'google-cloud-storage'")
 
+    # First try via public URL
+    try:
+        logging.info("Attempting to access via public URL first")
+        async with AsyncClient(timeout=get_settings().async_http_request_timeout) as client:
+            # Try with a different user agent to avoid potential filtering
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Accept": "application/pdf,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Connection": "keep-alive"
+            }
+            response = await client.get(uri_path, headers=headers, follow_redirects=True)
+            if response.status_code != 200:
+                raise ValueError(f"Failed to download from public URL: HTTP {response.status_code}, Response: {response.text}")
+
+            # Verify content type
+            content_type = response.headers.get("content-type", "")
+            if not content_type.startswith("application/pdf"):
+                logging.warning(f"Unexpected content type: {content_type} for URL: {uri_path}")
+
+            async with aiofiles.open(local_path, "wb") as afp:
+                await afp.write(response.content)
+                await afp.flush()
+
+            logging.info(f"Successfully downloaded via public URL to {local_path}")
+            return
+    except Exception as public_url_error:
+        logging.warning(f"Public URL access failed, falling back to GCS authentication: {str(public_url_error)}")
+        # Fall back to GCS authentication
+
+    # GCS authentication approach as fallback
     try:
         # Extract bucket and blob path from the URL
         # Format: https://storage.googleapis.com/bucket-name/path/to/file
@@ -200,35 +231,8 @@ async def download_from_gcs(uri_path: str, local_path: str) -> None:
             raise
 
     except Exception as e:
-        logging.error(f"Error downloading from GCS: {str(e)}")
-        # If GCS access failed, try via signed URL
-        try:
-            logging.info("Attempting to access via public URL")
-            async with AsyncClient(timeout=get_settings().async_http_request_timeout) as client:
-                # Try with a different user agent to avoid potential filtering
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                    "Accept": "application/pdf,*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Connection": "keep-alive"
-                }
-                response = await client.get(uri_path, headers=headers, follow_redirects=True)
-                if response.status_code != 200:
-                    raise ValueError(f"Failed to download from public URL: HTTP {response.status_code}, Response: {response.text}")
-
-                # Verify content type
-                content_type = response.headers.get("content-type", "")
-                if not content_type.startswith("application/pdf"):
-                    logging.warning(f"Unexpected content type: {content_type} for URL: {uri_path}")
-
-                async with aiofiles.open(local_path, "wb") as afp:
-                    await afp.write(response.content)
-                    await afp.flush()
-
-                logging.info(f"Successfully downloaded via public URL to {local_path}")
-        except Exception as inner_e:
-            logging.error(f"Error accessing via public URL: {str(inner_e)}")
-            raise ValueError(f"Failed to download from GCS: {str(e)}, and public URL access failed: {str(inner_e)}")
+        logging.error(f"Error downloading from GCS using authentication: {str(e)}")
+        raise ValueError(f"Failed to download: public URL access failed and GCS authentication failed: {str(e)}")
 
 
 @retry(
@@ -242,38 +246,44 @@ async def read_pdf_from_uri(uri_path: str) -> tuple[dict[int, str], int]:
         logging.debug(f"Downloading file from {uri_path}")
         with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
             try:
-                # Check if this is a GCS URL
-                if is_gcs_url(uri_path):
-                    logging.info(f"Detected Google Cloud Storage URL: {uri_path}")
-                    await download_from_gcs(uri_path, temp_file.name)
-                else:
-                    # Standard HTTP download
-                    async with AsyncClient(
-                        timeout=get_settings().async_http_request_timeout,
-                        follow_redirects=True
-                    ) as client:
-                        logging.debug(f"Sending HTTP request to {uri_path}")
-                        # Add user-agent to avoid potential filtering
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                            "Accept": "application/pdf,*/*",
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Connection": "keep-alive"
-                        }
+                # We use the same download approach for both GCS and standard URLs
+                # Always try HTTP download first, which will handle falling back to GCS auth if needed
+                async with AsyncClient(
+                    timeout=get_settings().async_http_request_timeout,
+                    follow_redirects=True
+                ) as client:
+                    logging.debug(f"Sending HTTP request to {uri_path}")
+                    # Add user-agent to avoid potential filtering
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                        "Accept": "application/pdf,*/*",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Connection": "keep-alive"
+                    }
+
+                    try:
                         response = await client.get(uri_path, headers=headers)
-                        if response.status_code != 200:
-                            logging.error(f"Failed to download PDF, status code: {response.status_code}, response: {response.text}")
+                        if response.status_code == 200:
+                            # Verify content type
+                            content_type = response.headers.get("content-type", "")
+                            if not content_type.startswith("application/pdf"):
+                                logging.warning(f"Unexpected content type: {content_type} for URL: {uri_path}")
+
+                            logging.debug(f"Writing response content to temporary file: {temp_file.name}")
+                            async with aiofiles.open(temp_file.name, "wb") as afp:
+                                await afp.write(response.content)
+                                await afp.flush()
+                        else:
                             raise ValueError(f"Failed to download PDF: HTTP {response.status_code}")
-
-                        # Verify content type
-                        content_type = response.headers.get("content-type", "")
-                        if not content_type.startswith("application/pdf"):
-                            logging.warning(f"Unexpected content type: {content_type} for URL: {uri_path}")
-
-                        logging.debug(f"Writing response content to temporary file: {temp_file.name}")
-                        async with aiofiles.open(temp_file.name, "wb") as afp:
-                            await afp.write(response.content)
-                            await afp.flush()
+                    except Exception as http_error:
+                        # If direct HTTP download fails and this is a GCS URL, try GCS-specific approach
+                        if is_gcs_url(uri_path):
+                            logging.info(f"Direct HTTP download failed, falling back to GCS download for: {uri_path}")
+                            await download_from_gcs(uri_path, temp_file.name)
+                        else:
+                            # For non-GCS URLs, propagate the error
+                            logging.error(f"Failed to download PDF, error: {str(http_error)}")
+                            raise
 
                 # Verify file exists and has content
                 if not os.path.exists(temp_file.name):
