@@ -35,9 +35,9 @@ from src.summarization import extract_and_reformat_summary, sanitize_markdown_sy
 print("DIRECT LOG: Starting application initialization", flush=True)
 print(f"DIRECT LOG: Python version: {sys.version}", flush=True)
 
-# Configure logging - CHANGED TO DEBUG
+# Configure logging - CHANGED TO INFO from DEBUG
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed from INFO to DEBUG
+    level=logging.INFO,  # Changed from DEBUG to INFO
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)

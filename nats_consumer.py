@@ -23,7 +23,7 @@ PENDING_MSG_LIMIT = 5
 # Configure root logger if not configured
 if not logging.root.handlers:
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
