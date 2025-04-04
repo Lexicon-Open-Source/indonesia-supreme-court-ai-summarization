@@ -48,8 +48,11 @@ async def initialize_nats() -> NATS:
     retry_delay = 2
     retry_count = 0
 
+    print(f"DIRECT LOG: Initializing NATS client with URL: {get_settings().nats__url}", flush=True)
+
     while retry_count < max_retries:
         try:
+            print(f"DIRECT LOG: Connecting to NATS, attempt {retry_count+1}/{max_retries}", flush=True)
             logger.debug(f"Initializing NATS client with URL: {get_settings().nats__url}, attempt {retry_count+1}/{max_retries}")
             nats_client = NATS()
             await nats_client.connect(
@@ -59,16 +62,20 @@ async def initialize_nats() -> NATS:
                 max_reconnect_attempts=10,
                 connect_timeout=10,
             )
+            print("DIRECT LOG: NATS client initialized and connected successfully", flush=True)
             logger.debug("NATS client initialized and connected successfully")
             return nats_client
         except Exception as e:
             retry_count += 1
+            print(f"DIRECT LOG: Failed to connect to NATS (attempt {retry_count}/{max_retries}): {str(e)}", flush=True)
             logger.error(f"Failed to connect to NATS (attempt {retry_count}/{max_retries}): {str(e)}")
             if retry_count < max_retries:
+                print(f"DIRECT LOG: Retrying in {retry_delay} seconds...", flush=True)
                 logger.info(f"Retrying in {retry_delay} seconds...")
                 await asyncio.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
             else:
+                print("DIRECT LOG: Max retries reached. Could not connect to NATS server.", flush=True)
                 logger.error("Max retries reached. Could not connect to NATS server.")
                 raise
 

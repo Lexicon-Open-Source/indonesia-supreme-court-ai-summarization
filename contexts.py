@@ -1,4 +1,5 @@
 from sqlalchemy.ext.asyncio import create_async_engine
+import sys
 
 from nats_consumer import (
     generate_nats_stream_configs,
@@ -23,12 +24,27 @@ class AppContexts:
         )
 
     async def get_app_contexts(self, init_nats: bool = True) -> "AppContexts":
+        print(f"DIRECT LOG: get_app_contexts called with init_nats={init_nats}", flush=True)
         if init_nats and self.nats_client is None:
-            self.nats_client = await initialize_nats()
-            stream_configs = generate_nats_stream_configs()
-            self.jetstream_client = await initialize_jetstream_client(
-                nats_client=self.nats_client,
-                stream_configs=stream_configs,
-            )
+            print(f"DIRECT LOG: Initializing NATS with URL: {get_settings().nats__url}", flush=True)
+            try:
+                self.nats_client = await initialize_nats()
+                print("DIRECT LOG: NATS initialized successfully", flush=True)
+                stream_configs = generate_nats_stream_configs()
+                print(f"DIRECT LOG: Generated stream configs: {stream_configs}", flush=True)
+                self.jetstream_client = await initialize_jetstream_client(
+                    nats_client=self.nats_client,
+                    stream_configs=stream_configs,
+                )
+                print("DIRECT LOG: JetStream client initialized successfully", flush=True)
+            except Exception as e:
+                print(f"DIRECT LOG: ERROR initializing NATS: {str(e)}", flush=True)
+                # Re-raise the exception to be caught by the caller
+                raise
+        elif self.nats_client is not None:
+            print(f"DIRECT LOG: Using existing NATS client, connected: {self.nats_client.is_connected}", flush=True)
+        else:
+            print("DIRECT LOG: Skipping NATS initialization as requested", flush=True)
 
+        print("DIRECT LOG: Successfully prepared app contexts", flush=True)
         return self
