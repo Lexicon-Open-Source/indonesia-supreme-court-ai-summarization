@@ -32,12 +32,8 @@ except ImportError:
 
 # Add PyPDF2 as another alternative
 try:
-    try:
-        import PyPDF2
-    except ImportError:
-        # Try older version name
-        import PyPDF2 as PyPDF2
-    HAS_PYPDF2 = True
+    # We won't use PyPDF2 due to compatibility issues
+    HAS_PYPDF2 = False
 except ImportError:
     HAS_PYPDF2 = False
 
@@ -361,22 +357,7 @@ async def read_pdf_from_uri(uri_path: str) -> tuple[dict[int, str], int]:
                 logging.info(f"Primary extraction failed: {str(primary_extraction_error)}")
                 extraction_error = primary_extraction_error
 
-            # If primary method failed, try PyPDF2
-            if not extraction_successful and HAS_PYPDF2:
-                try:
-                    logging.info("Primary extraction failed. Trying PyPDF2 extraction...")
-                    contents = await extract_text_with_pypdf(temp_file_path)
-                    max_page = max(contents.keys()) if contents else 0
-
-                    if contents and max_page > 0:
-                        extraction_successful = True
-                        logging.info(f"PyPDF2 extraction successful: {len(contents)} pages, max page: {max_page}")
-                except Exception as pypdf_error:
-                    logging.warning(f"PyPDF2 extraction failed: {str(pypdf_error)}")
-                    if not extraction_error:
-                        extraction_error = pypdf_error
-
-            # If still no success and OCR is available, try OCR
+            # If primary method failed, try OCR
             if not extraction_successful and HAS_OCR:
                 try:
                     logging.info("Previous extractions failed. Trying OCR extraction...")
@@ -482,7 +463,10 @@ async def extract_text_with_ocr(pdf_path: str) -> dict[int, str]:
     # Check if poppler is installed (required by pdf2image)
     try:
         from pdf2image.pdf2image import pdfinfo_from_path
-        _ = pdfinfo_from_path(pdf_path)  # This will fail if poppler is not installed
+        pdf_info = pdfinfo_from_path(pdf_path)  # This will fail if poppler is not installed
+        # Use pdfinfo to get page count directly
+        total_pages = pdf_info.get("Pages", 0)
+        logging.info(f"PDF has {total_pages} pages according to pdfinfo")
     except Exception as poppler_error:
         logging.error(f"Poppler dependency check failed: {str(poppler_error)}")
         raise ValueError("Poppler not installed or not working. Please ensure poppler-utils is installed on the system.")
@@ -493,20 +477,6 @@ async def extract_text_with_ocr(pdf_path: str) -> dict[int, str]:
         contents = {}
         batch_size = 5  # Process 5 pages at a time to manage memory
 
-        # Get total number of pages first
-        with open(pdf_path, "rb") as f:
-            if HAS_PYPDF2:
-                try:
-                    pdf = PyPDF2.PdfReader(f)
-                    total_pages = len(pdf.pages)
-                    logging.info(f"PDF has {total_pages} pages, processing in batches of {batch_size}")
-                except Exception:
-                    # If we can't get page count, use default batch processing
-                    logging.warning("Could not determine page count, using default batch processing")
-                    total_pages = None
-            else:
-                total_pages = None
-
         # Convert in batches
         current_page = 0
         while True:
@@ -514,6 +484,11 @@ async def extract_text_with_ocr(pdf_path: str) -> dict[int, str]:
             try:
                 batch_start = current_page
                 batch_end = current_page + batch_size - 1
+
+                # If we know the total pages, don't try to process beyond that
+                if total_pages > 0 and batch_start >= total_pages:
+                    break
+
                 logging.debug(f"Processing OCR batch: pages {batch_start+1} to {batch_end+1}")
 
                 # Convert specific page range to images
@@ -558,7 +533,7 @@ async def extract_text_with_ocr(pdf_path: str) -> dict[int, str]:
                 del images
 
                 # If we know the total pages and have processed them all, exit
-                if total_pages is not None and current_page >= total_pages:
+                if total_pages > 0 and current_page >= total_pages:
                     break
 
             except Exception as batch_error:
@@ -577,51 +552,3 @@ async def extract_text_with_ocr(pdf_path: str) -> dict[int, str]:
     except Exception as e:
         logging.error(f"OCR extraction failed: {str(e)}")
         raise ValueError(f"OCR extraction failed: {str(e)}")
-
-
-async def extract_text_with_pypdf(pdf_path: str) -> dict[int, str]:
-    """
-    Extract text from PDF using PyPDF2.
-
-    Args:
-        pdf_path: Path to the PDF file
-
-    Returns:
-        Dictionary mapping page numbers to extracted text
-
-    Raises:
-        ValueError: If PyPDF2 extraction fails
-    """
-    if not HAS_PYPDF2:
-        raise ValueError("PyPDF2 is not installed. Please install 'PyPDF2'")
-
-    logging.info(f"Attempting PyPDF2 extraction on {pdf_path}")
-    try:
-        with open(pdf_path, "rb") as file:
-            reader = PyPDF2.PdfReader(file)
-            contents = {}
-
-            for i in range(len(reader.pages)):
-                # Page numbers start from 1
-                page_num = i + 1
-                logging.debug(f"PyPDF2 processing page {page_num}")
-
-                # Extract text using PyPDF2
-                page = reader.pages[i]
-                text = page.extract_text()
-
-                if text.strip():
-                    contents[page_num] = text
-
-                # Yield to event loop occasionally
-                if i % 5 == 0:
-                    await asyncio.sleep(0.01)
-
-            if not contents:
-                raise ValueError("PyPDF2 extraction produced no text")
-
-            logging.info(f"Successfully extracted {len(contents)} pages using PyPDF2")
-            return contents
-    except Exception as e:
-        logging.error(f"PyPDF2 extraction failed: {str(e)}")
-        raise ValueError(f"PyPDF2 extraction failed: {str(e)}")
