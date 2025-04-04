@@ -42,20 +42,35 @@ STREAM_CONFIG = StreamConfig(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
 
 async def initialize_nats() -> NATS:
     """
-    Initialize the NATS client and connect to the NATS server.
-
-    Returns:
-        NATS: The initialized and connected NATS client.
+    Initialize the NATS client and connect to the NATS server with retries.
     """
-    logger.debug(f"Initializing NATS client with URL: {get_settings().nats__url}")
-    nats_client = NATS()
-    await nats_client.connect(
-        get_settings().nats__url,
-        error_cb=error_callback,
-    )
-    logger.debug("NATS client initialized and connected")
+    max_retries = 5
+    retry_delay = 2
+    retry_count = 0
 
-    return nats_client
+    while retry_count < max_retries:
+        try:
+            logger.debug(f"Initializing NATS client with URL: {get_settings().nats__url}, attempt {retry_count+1}/{max_retries}")
+            nats_client = NATS()
+            await nats_client.connect(
+                get_settings().nats__url,
+                error_cb=error_callback,
+                reconnect_time_wait=2,
+                max_reconnect_attempts=10,
+                connect_timeout=10,
+            )
+            logger.debug("NATS client initialized and connected successfully")
+            return nats_client
+        except Exception as e:
+            retry_count += 1
+            logger.error(f"Failed to connect to NATS (attempt {retry_count}/{max_retries}): {str(e)}")
+            if retry_count < max_retries:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error("Max retries reached. Could not connect to NATS server.")
+                raise
 
 
 def generate_nats_stream_configs() -> list[StreamConfig]:
