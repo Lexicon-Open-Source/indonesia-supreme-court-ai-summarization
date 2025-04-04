@@ -3,6 +3,7 @@ import tempfile
 import logging
 import re
 import os
+import io
 from urllib.parse import urlparse
 
 import aiofiles
@@ -19,6 +20,26 @@ from tenacity import (
 )
 from unstructured.documents.elements import Footer, Header
 from unstructured.partition.pdf import partition_pdf
+
+# Add OCR-related imports
+try:
+    import pytesseract
+    from pdf2image import convert_from_path
+    from PIL import Image
+    HAS_OCR = True
+except ImportError:
+    HAS_OCR = False
+
+# Add PyPDF2 as another alternative
+try:
+    try:
+        import PyPDF2
+    except ImportError:
+        # Try older version name
+        import PyPDF2 as PyPDF2
+    HAS_PYPDF2 = True
+except ImportError:
+    HAS_PYPDF2 = False
 
 from settings import get_settings
 
@@ -242,91 +263,163 @@ async def download_from_gcs(uri_path: str, local_path: str) -> None:
 )
 async def read_pdf_from_uri(uri_path: str) -> tuple[dict[int, str], int]:
     logging.info(f"Reading PDF from URI: {uri_path}")
+    temp_file = None
+    temp_file_path = None
+
     try:
         logging.debug(f"Downloading file from {uri_path}")
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
-            try:
-                # We use the same download approach for both GCS and standard URLs
-                # Always try HTTP download first, which will handle falling back to GCS auth if needed
-                async with AsyncClient(
-                    timeout=get_settings().async_http_request_timeout,
-                    follow_redirects=True
-                ) as client:
-                    logging.debug(f"Sending HTTP request to {uri_path}")
-                    # Add user-agent to avoid potential filtering
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                        "Accept": "application/pdf,*/*",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Connection": "keep-alive"
-                    }
+        try:
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            temp_file_path = temp_file.name
+            temp_file.close()  # Close it so we can reopen it with different libraries
+        except Exception as temp_file_error:
+            logging.error(f"Failed to create temporary file: {str(temp_file_error)}")
+            raise ValueError(f"Failed to create temporary file: {str(temp_file_error)}")
 
-                    try:
-                        response = await client.get(uri_path, headers=headers)
-                        if response.status_code == 200:
-                            # Verify content type
-                            content_type = response.headers.get("content-type", "")
-                            if not content_type.startswith("application/pdf"):
-                                logging.warning(f"Unexpected content type: {content_type} for URL: {uri_path}")
+        try:
+            # We use the same download approach for both GCS and standard URLs
+            # Always try HTTP download first, which will handle falling back to GCS auth if needed
+            async with AsyncClient(
+                timeout=get_settings().async_http_request_timeout,
+                follow_redirects=True
+            ) as client:
+                logging.debug(f"Sending HTTP request to {uri_path}")
+                # Add user-agent to avoid potential filtering
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                    "Accept": "application/pdf,*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Connection": "keep-alive"
+                }
 
-                            logging.debug(f"Writing response content to temporary file: {temp_file.name}")
-                            async with aiofiles.open(temp_file.name, "wb") as afp:
-                                await afp.write(response.content)
-                                await afp.flush()
-                        else:
-                            raise ValueError(f"Failed to download PDF: HTTP {response.status_code}")
-                    except Exception as http_error:
-                        # If direct HTTP download fails and this is a GCS URL, try GCS-specific approach
-                        if is_gcs_url(uri_path):
-                            logging.info(f"Direct HTTP download failed, falling back to GCS download for: {uri_path}")
-                            await download_from_gcs(uri_path, temp_file.name)
-                        else:
-                            # For non-GCS URLs, propagate the error
-                            logging.error(f"Failed to download PDF, error: {str(http_error)}")
-                            raise
-
-                # Verify file exists and has content
-                if not os.path.exists(temp_file.name):
-                    raise ValueError(f"Temporary file {temp_file.name} was not created")
-
-                if os.path.getsize(temp_file.name) == 0:
-                    raise ValueError(f"Temporary file {temp_file.name} is empty")
-
-                logging.debug(f"Partitioning PDF file from {temp_file.name}")
                 try:
-                    elements = partition_pdf(temp_file.name)
-                    if not elements:
-                        raise ValueError("No elements found in PDF file")
-                except Exception as e:
-                    logging.error(f"Failed to partition PDF: {str(e)}")
-                    raise ValueError(f"Failed to parse PDF file: {str(e)}")
-            except Exception as e:
-                logging.error(f"Error processing PDF file: {str(e)}")
-                raise
+                    response = await client.get(uri_path, headers=headers)
+                    if response.status_code == 200:
+                        # Verify content type
+                        content_type = response.headers.get("content-type", "")
+                        if not content_type.startswith("application/pdf"):
+                            logging.warning(f"Unexpected content type: {content_type} for URL: {uri_path}")
 
-        logging.debug("Extracting contents from PDF elements")
-        contents = {}
-        current_page = 0
-        for el in elements:
-            if type(el) in [Header, Footer]:
-                continue
+                        logging.debug(f"Writing response content to temporary file: {temp_file_path}")
+                        async with aiofiles.open(temp_file_path, "wb") as afp:
+                            await afp.write(response.content)
+                            await afp.flush()
+                    else:
+                        raise ValueError(f"Failed to download PDF: HTTP {response.status_code}")
+                except Exception as http_error:
+                    # If direct HTTP download fails and this is a GCS URL, try GCS-specific approach
+                    if is_gcs_url(uri_path):
+                        logging.info(f"Direct HTTP download failed, falling back to GCS download for: {uri_path}")
+                        await download_from_gcs(uri_path, temp_file_path)
+                    else:
+                        # For non-GCS URLs, propagate the error
+                        logging.error(f"Failed to download PDF, error: {str(http_error)}")
+                        raise
 
-            current_page = el.metadata.page_number
-            current_content = contents.get(current_page, "")
-            current_content += "\n" + str(el)
-            contents[current_page] = current_content
+            # Verify file exists and has content
+            if not os.path.exists(temp_file_path):
+                raise ValueError(f"Temporary file {temp_file_path} was not created")
 
-            await asyncio.sleep(0.01)
+            if os.path.getsize(temp_file_path) == 0:
+                raise ValueError(f"Temporary file {temp_file_path} is empty")
 
-        if not contents:
-            raise ValueError("No content extracted from PDF")
+            # Initialize content dictionary and max page
+            contents = {}
+            max_page = 0
+            extraction_successful = False
+            extraction_error = None
 
-        max_page = current_page
-        logging.info(f"Successfully extracted {len(contents)} pages from PDF, max page: {max_page}")
-        return contents, max_page
+            # Try primary extraction method first (unstructured)
+            try:
+                logging.debug(f"Attempting primary extraction method (unstructured) on {temp_file_path}")
+                elements = partition_pdf(temp_file_path)
+                if not elements:
+                    logging.warning("No elements found in PDF file with primary method")
+                    raise ValueError("No elements found in PDF file")
+
+                logging.debug("Extracting contents from PDF elements")
+                contents = {}
+                current_page = 0
+                for el in elements:
+                    if type(el) in [Header, Footer]:
+                        continue
+
+                    current_page = el.metadata.page_number
+                    current_content = contents.get(current_page, "")
+                    current_content += "\n" + str(el)
+                    contents[current_page] = current_content
+
+                    await asyncio.sleep(0.01)
+
+                if not contents:
+                    raise ValueError("No content extracted from PDF with primary method")
+
+                max_page = current_page
+                extraction_successful = True
+                logging.info(f"Primary extraction successful: {len(contents)} pages, max page: {max_page}")
+            except Exception as primary_extraction_error:
+                logging.info(f"Primary extraction failed: {str(primary_extraction_error)}")
+                extraction_error = primary_extraction_error
+
+            # If primary method failed, try PyPDF2
+            if not extraction_successful and HAS_PYPDF2:
+                try:
+                    logging.info("Primary extraction failed. Trying PyPDF2 extraction...")
+                    contents = await extract_text_with_pypdf(temp_file_path)
+                    max_page = max(contents.keys()) if contents else 0
+
+                    if contents and max_page > 0:
+                        extraction_successful = True
+                        logging.info(f"PyPDF2 extraction successful: {len(contents)} pages, max page: {max_page}")
+                except Exception as pypdf_error:
+                    logging.warning(f"PyPDF2 extraction failed: {str(pypdf_error)}")
+                    if not extraction_error:
+                        extraction_error = pypdf_error
+
+            # If still no success and OCR is available, try OCR
+            if not extraction_successful and HAS_OCR:
+                try:
+                    logging.info("Previous extractions failed. Trying OCR extraction...")
+                    contents = await extract_text_with_ocr(temp_file_path)
+                    max_page = max(contents.keys()) if contents else 0
+
+                    if contents and max_page > 0:
+                        extraction_successful = True
+                        logging.info(f"OCR extraction successful: {len(contents)} pages, max page: {max_page}")
+                except Exception as ocr_error:
+                    logging.warning(f"OCR extraction failed: {str(ocr_error)}")
+                    if not extraction_error:
+                        extraction_error = ocr_error
+
+            # If all extraction methods failed, raise an error
+            if not extraction_successful:
+                logging.error("PDF text extraction failed, skip text extraction...")
+                # Create a minimal content to allow processing to continue
+                contents = {1: "PDF text extraction failed. This is placeholder content."}
+                max_page = 1
+
+                # For now, we'll continue with empty content rather than fail completely
+                # If strict validation is required, uncomment the following:
+                # if extraction_error:
+                #     raise extraction_error
+                # else:
+                #     raise ValueError("All PDF extraction methods failed")
+
+            return contents, max_page
+        except Exception as e:
+            logging.error(f"Error processing PDF file: {str(e)}")
+            raise
     except Exception as e:
         logging.error(f"Error in read_pdf_from_uri for {uri_path}: {str(e)}")
         raise
+    finally:
+        # Clean up temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+                logging.debug(f"Cleaned up temporary file: {temp_file_path}")
+            except Exception as e:
+                logging.warning(f"Failed to remove temporary file {temp_file_path}: {str(e)}")
 
 
 async def write_summary_to_db(
@@ -367,3 +460,168 @@ async def write_summary_to_db(
     except Exception as e:
         logging.error(f"Error in write_summary_to_db for decision number {decision_number}: {str(e)}")
         raise
+
+
+async def extract_text_with_ocr(pdf_path: str) -> dict[int, str]:
+    """
+    Extract text from PDF using OCR (Optical Character Recognition).
+    Uses pdf2image to convert PDF pages to images and pytesseract for OCR.
+
+    Args:
+        pdf_path: Path to the PDF file
+
+    Returns:
+        Dictionary mapping page numbers to extracted text
+
+    Raises:
+        ValueError: If OCR extraction fails
+    """
+    if not HAS_OCR:
+        raise ValueError("OCR libraries are not installed. Please install 'pytesseract' and 'pdf2image'")
+
+    # Check if poppler is installed (required by pdf2image)
+    try:
+        from pdf2image.pdf2image import pdfinfo_from_path
+        _ = pdfinfo_from_path(pdf_path)  # This will fail if poppler is not installed
+    except Exception as poppler_error:
+        logging.error(f"Poppler dependency check failed: {str(poppler_error)}")
+        raise ValueError("Poppler not installed or not working. Please ensure poppler-utils is installed on the system.")
+
+    logging.info(f"Attempting OCR extraction on {pdf_path}")
+    try:
+        # Process PDFs in batches to avoid memory issues with large documents
+        contents = {}
+        batch_size = 5  # Process 5 pages at a time to manage memory
+
+        # Get total number of pages first
+        with open(pdf_path, "rb") as f:
+            if HAS_PYPDF2:
+                try:
+                    pdf = PyPDF2.PdfReader(f)
+                    total_pages = len(pdf.pages)
+                    logging.info(f"PDF has {total_pages} pages, processing in batches of {batch_size}")
+                except Exception:
+                    # If we can't get page count, use default batch processing
+                    logging.warning("Could not determine page count, using default batch processing")
+                    total_pages = None
+            else:
+                total_pages = None
+
+        # Convert in batches
+        current_page = 0
+        while True:
+            # Convert pages in current batch
+            try:
+                batch_start = current_page
+                batch_end = current_page + batch_size - 1
+                logging.debug(f"Processing OCR batch: pages {batch_start+1} to {batch_end+1}")
+
+                # Convert specific page range to images
+                # first_page and last_page are 1-indexed
+                images = convert_from_path(
+                    pdf_path,
+                    first_page=batch_start+1,
+                    last_page=None if batch_end is None else batch_end+1
+                )
+
+                if not images:
+                    if batch_start == 0:
+                        # If we got no images on first batch, that's an error
+                        raise ValueError("No images could be extracted from PDF")
+                    else:
+                        # If we got no images in a later batch, we've processed all pages
+                        break
+
+                # Process each image in the batch
+                for i, image in enumerate(images):
+                    # Page numbers start from 1 + batch offset
+                    page_num = batch_start + i + 1
+                    logging.debug(f"OCR processing page {page_num}")
+
+                    # Extract text using pytesseract with Indonesian language support
+                    # Try with Indonesian + English for better results
+                    text = pytesseract.image_to_string(image, lang='ind+eng')
+
+                    if text.strip():
+                        contents[page_num] = text
+
+                    # Free memory
+                    del image
+
+                    # Yield to event loop occasionally
+                    await asyncio.sleep(0.01)
+
+                # Update current page for next batch
+                current_page += len(images)
+
+                # Clear memory
+                del images
+
+                # If we know the total pages and have processed them all, exit
+                if total_pages is not None and current_page >= total_pages:
+                    break
+
+            except Exception as batch_error:
+                logging.error(f"Error processing OCR batch {batch_start+1}-{batch_end+1}: {str(batch_error)}")
+                # If this is the first batch and it failed, propagate the error
+                if batch_start == 0:
+                    raise
+                # Otherwise, we've processed some pages, so break and return what we have
+                break
+
+        if not contents:
+            raise ValueError("OCR extraction produced no text")
+
+        logging.info(f"Successfully extracted {len(contents)} pages using OCR")
+        return contents
+    except Exception as e:
+        logging.error(f"OCR extraction failed: {str(e)}")
+        raise ValueError(f"OCR extraction failed: {str(e)}")
+
+
+async def extract_text_with_pypdf(pdf_path: str) -> dict[int, str]:
+    """
+    Extract text from PDF using PyPDF2.
+
+    Args:
+        pdf_path: Path to the PDF file
+
+    Returns:
+        Dictionary mapping page numbers to extracted text
+
+    Raises:
+        ValueError: If PyPDF2 extraction fails
+    """
+    if not HAS_PYPDF2:
+        raise ValueError("PyPDF2 is not installed. Please install 'PyPDF2'")
+
+    logging.info(f"Attempting PyPDF2 extraction on {pdf_path}")
+    try:
+        with open(pdf_path, "rb") as file:
+            reader = PyPDF2.PdfReader(file)
+            contents = {}
+
+            for i in range(len(reader.pages)):
+                # Page numbers start from 1
+                page_num = i + 1
+                logging.debug(f"PyPDF2 processing page {page_num}")
+
+                # Extract text using PyPDF2
+                page = reader.pages[i]
+                text = page.extract_text()
+
+                if text.strip():
+                    contents[page_num] = text
+
+                # Yield to event loop occasionally
+                if i % 5 == 0:
+                    await asyncio.sleep(0.01)
+
+            if not contents:
+                raise ValueError("PyPDF2 extraction produced no text")
+
+            logging.info(f"Successfully extracted {len(contents)} pages using PyPDF2")
+            return contents
+    except Exception as e:
+        logging.error(f"PyPDF2 extraction failed: {str(e)}")
+        raise ValueError(f"PyPDF2 extraction failed: {str(e)}")

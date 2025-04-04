@@ -8,7 +8,8 @@ WORKDIR $PYSETUP_PATH
 # Install system dependencies, UV, and create credential directory in one layer
 RUN apt-get update && \
     apt-get install --no-install-recommends -y build-essential \
-    clang curl libgl1 libglib2.0-0 poppler-utils tesseract-ocr ca-certificates && \
+    clang curl libgl1 libglib2.0-0 poppler-utils tesseract-ocr tesseract-ocr-ind \
+    ca-certificates python3-dev default-libmysqlclient-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     curl -LsSf https://astral.sh/uv/0.4.29/install.sh | sh && \
     uv python install 3.10 && \
