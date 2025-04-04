@@ -164,3 +164,4 @@ cython_debug/
 # Others
 *.pdf
 *summary.md
+lexicon-bo-crawler-service-account.json
