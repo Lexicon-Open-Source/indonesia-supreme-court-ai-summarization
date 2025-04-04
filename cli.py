@@ -11,7 +11,7 @@ from src.summarization import extract_and_reformat_summary, sanitize_markdown_sy
 
 # Configure logging for CLI
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
