@@ -200,31 +200,37 @@ def create_job_consumer_async_task(
     logger.debug(f"Creating {num_of_consumer_instances} job consumer tasks, use_push_subscription={use_push_subscription}")
     nats_consumer_job_connection = []
 
-    # Use different consumer names for each instance to avoid conflicts
-    for i in range(num_of_consumer_instances):
-        consumer_name = f"{DURABLE_NAME}_{i+1}"
-        logger.debug(f"Creating consumer #{i+1} with name: {consumer_name}")
+    # Create a single durable consumer with a delivery group
+    # All instances will work as a load-balanced group
+    consumer_name = DURABLE_NAME
+    logger.debug(f"Creating shared consumer with name: {consumer_name}")
 
-        # Clone consumer config for this instance
-        instance_config = ConsumerConfig(
-            filter_subject=consumer_config.filter_subject,
-            durable_name=consumer_name,
-            ack_wait=consumer_config.ack_wait,
-            max_deliver=consumer_config.max_deliver,
-            max_ack_pending=consumer_config.max_ack_pending,
-        )
+    # Create a single consumer config with a delivery group
+    shared_config = ConsumerConfig(
+        filter_subject=consumer_config.filter_subject,
+        durable_name=consumer_name,
+        deliver_group="summarization_workers",  # This is key for load balancing
+        ack_wait=consumer_config.ack_wait,
+        max_deliver=consumer_config.max_deliver,
+        max_ack_pending=consumer_config.max_ack_pending,
+    )
+
+    # Use different consumer IDs for each instance to help with logging
+    for i in range(num_of_consumer_instances):
+        consumer_id = i+1
+        logger.debug(f"Creating consumer task #{consumer_id} using shared consumer: {consumer_name}")
 
         task = asyncio.create_task(
             run_pull_job_consumer_improved(
                 nats_client=nats_client,
                 jetstream_client=jetstream_client,
-                consumer_config=instance_config,
+                consumer_config=shared_config,
                 processing_func=processing_func,
-                consumer_id=i+1,
+                consumer_id=consumer_id,
             )
         )
 
-        logger.debug(f"Created task for consumer {consumer_name}: {task}")
+        logger.debug(f"Created task for consumer worker {consumer_id}: {task}")
         nats_consumer_job_connection.append(task)
 
     logger.debug(f"Created {len(nats_consumer_job_connection)} consumer tasks")
@@ -251,8 +257,8 @@ async def run_pull_job_consumer_improved(
     Returns:
         None
     """
-    consumer_name = f"consumer-{consumer_id}"
-    logger.info(f"Starting {consumer_name} using pull-based subscription with consumer config: {consumer_config.durable_name}")
+    worker_name = f"worker-{consumer_id}"
+    logger.info(f"Starting {worker_name} using pull-based subscription with shared consumer config: {consumer_config.durable_name}")
 
     # Initialization of local variables
     consumerInfo = None
@@ -263,12 +269,12 @@ async def run_pull_job_consumer_improved(
     while True:
         try:
             if not nats_client.is_connected:
-                logger.warning(f"{consumer_name} NATS client disconnected, attempting to reconnect...")
+                logger.warning(f"{worker_name} NATS client disconnected, attempting to reconnect...")
                 try:
                     # Attempt to reconnect if disconnected
                     if reconnect_attempts < max_reconnect_attempts:
                         reconnect_attempts += 1
-                        logger.info(f"{consumer_name} Reconnecting to NATS (attempt {reconnect_attempts}/{max_reconnect_attempts})")
+                        logger.info(f"{worker_name} Reconnecting to NATS (attempt {reconnect_attempts}/{max_reconnect_attempts})")
                         await nats_client.connect(
                             get_settings().nats__url,
                             error_cb=error_callback,
@@ -278,15 +284,15 @@ async def run_pull_job_consumer_improved(
                         )
                         # Get a new jetstream client after reconnection
                         jetstream_client = nats_client.jetstream()
-                        logger.info(f"{consumer_name} Successfully reconnected to NATS")
+                        logger.info(f"{worker_name} Successfully reconnected to NATS")
                         reconnect_attempts = 0  # Reset the counter on successful reconnection
                     else:
-                        logger.error(f"{consumer_name} Max reconnection attempts reached. Sleeping before retry...")
+                        logger.error(f"{worker_name} Max reconnection attempts reached. Sleeping before retry...")
                         await asyncio.sleep(30)  # Longer delay before trying to reconnect again
                         reconnect_attempts = 0  # Reset counter to try again
                         continue
                 except Exception as reconnect_error:
-                    logger.error(f"{consumer_name} Failed to reconnect to NATS: {reconnect_error}")
+                    logger.error(f"{worker_name} Failed to reconnect to NATS: {reconnect_error}")
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, 30)  # Exponential backoff capped at 30 seconds
                     continue
@@ -297,30 +303,31 @@ async def run_pull_job_consumer_improved(
                     stream=consumer_config.filter_subject.split('.')[0],
                     consumer=consumer_config.durable_name,
                 )
-                logger.debug(f"{consumer_name} Consumer exists: {consumer_config.durable_name}")
+                logger.debug(f"{worker_name} Shared consumer exists: {consumer_config.durable_name}")
             except nats.js.errors.NotFoundError:
-                logger.info(f"{consumer_name} Creating consumer: {consumer_config.durable_name}")
+                logger.info(f"{worker_name} Creating shared consumer: {consumer_config.durable_name}")
                 consumerInfo = await jetstream_client.add_consumer(
                     stream=consumer_config.filter_subject.split('.')[0],
                     config=consumer_config
                 )
-                logger.info(f"{consumer_name} Created consumer: {consumer_config.durable_name}")
+                logger.info(f"{worker_name} Created shared consumer: {consumer_config.durable_name}")
             except Exception as consumer_error:
-                logger.error(f"{consumer_name} Error checking/creating consumer: {consumer_error}")
+                logger.error(f"{worker_name} Error checking/creating consumer: {consumer_error}")
                 await asyncio.sleep(2)
                 continue
 
             # Fetch and process messages with improved error handling
             try:
                 # Use pull_subscribe instead of fetch
-                logger.debug(f"{consumer_name} Setting up pull subscription...")
+                logger.debug(f"{worker_name} Setting up pull subscription...")
                 subscription = await jetstream_client.pull_subscribe(
                     subject=consumer_config.filter_subject,
                     durable=consumer_config.durable_name,
+                    config=consumer_config,  # Pass the full config to ensure deliver_group is used
                 )
 
                 # Pull messages in batches
-                logger.debug(f"{consumer_name} Pulling batch of messages (max 1)...")
+                logger.debug(f"{worker_name} Pulling batch of messages (max 1)...")
                 messages = await subscription.fetch(batch=1, timeout=30)
 
                 msg_count = len(messages)
@@ -334,39 +341,39 @@ async def run_pull_job_consumer_improved(
                             msg_id = msg.metadata.stream_seq
                         else:
                             msg_id = "unknown"
-                        logger.info(f"{consumer_name} Processing message {msg_id}")
+                        logger.info(f"{worker_name} Processing message {msg_id}")
                     except Exception as e:
-                        logger.info(f"{consumer_name} Processing message (could not determine sequence: {e})")
+                        logger.info(f"{worker_name} Processing message (could not determine sequence: {e})")
 
                     # Process the message with timeout protection
                     try:
                         # We don't use a timeout here because the processing function should handle its own timeouts
                         await processing_func(msg)
-                        logger.info(f"{consumer_name} Successfully processed message")
+                        logger.info(f"{worker_name} Successfully processed message")
                     except Exception as processing_error:
-                        logger.error(f"{consumer_name} Error processing message: {processing_error}")
+                        logger.error(f"{worker_name} Error processing message: {processing_error}")
                         # The processing function should handle its own ack/nack
 
                 if msg_count == 0:
                     # No messages received, wait briefly before fetching again
-                    logger.debug(f"{consumer_name} No messages received, waiting before next fetch")
+                    logger.debug(f"{worker_name} No messages received, waiting before next fetch")
                     await asyncio.sleep(1)
 
             except nats.errors.TimeoutError:
-                logger.debug(f"{consumer_name} Timeout waiting for messages, will retry")
+                logger.debug(f"{worker_name} Timeout waiting for messages, will retry")
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
-                logger.info(f"{consumer_name} Task was cancelled, exiting")
+                logger.info(f"{worker_name} Task was cancelled, exiting")
                 raise
             except Exception as fetch_error:
-                logger.error(f"{consumer_name} Error fetching messages: {fetch_error}")
+                logger.error(f"{worker_name} Error fetching messages: {fetch_error}")
                 await asyncio.sleep(3)  # Wait before retry
 
         except asyncio.CancelledError:
-            logger.info(f"{consumer_name} Task was cancelled, exiting")
+            logger.info(f"{worker_name} Task was cancelled, exiting")
             raise
         except Exception as e:
-            logger.error(f"{consumer_name} Unexpected error in consumer loop: {e}")
+            logger.error(f"{worker_name} Unexpected error in consumer loop: {e}")
             await asyncio.sleep(5)  # Wait before restarting the loop
 
 
