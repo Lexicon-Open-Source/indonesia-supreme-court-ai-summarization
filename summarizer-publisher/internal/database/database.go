@@ -83,17 +83,90 @@ type ExtractionID struct {
 func (d *Database) GetExtractionIDs(batchSize int) ([]ExtractionID, error) {
 	logger.Debugf("Fetching extraction IDs with batch size: %d", batchSize)
 
-	// Get all supreme court extractions regardless of processing status
-	query := `
+	// Get all decision numbers that already have summaries
+	// Use prepared statement for better performance
+	existingQuery := `
+		SELECT decision_number
+		FROM cases
+		WHERE summary_en IS NOT NULL
+	`
+
+	// Create temporary table to hold decision numbers with English summaries
+	_, err := d.crawlerDb.Exec(`CREATE TEMPORARY TABLE IF NOT EXISTS temp_processed_decisions (decision_number TEXT PRIMARY KEY)`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary table: %w", err)
+	}
+
+	// Clean previous data if any
+	_, err = d.crawlerDb.Exec(`TRUNCATE TABLE temp_processed_decisions`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to truncate temporary table: %w", err)
+	}
+
+	// Get decisions with summaries from summary database
+	existingRows, err := d.summaryDb.Query(existingQuery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query cases with summaries: %w", err)
+	}
+	defer existingRows.Close()
+
+	// Insert decision numbers to temporary table for efficient joining
+	txn, err := d.crawlerDb.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	stmt, err := txn.Prepare(`INSERT INTO temp_processed_decisions (decision_number) VALUES ($1) ON CONFLICT DO NOTHING`)
+	if err != nil {
+		txn.Rollback()
+		return nil, fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	decisionsCount := 0
+	for existingRows.Next() {
+		var decisionNumber string
+		if err := existingRows.Scan(&decisionNumber); err != nil {
+			txn.Rollback()
+			return nil, fmt.Errorf("failed to scan existing decision number: %w", err)
+		}
+
+		if decisionNumber != "" {
+			if _, err := stmt.Exec(decisionNumber); err != nil {
+				txn.Rollback()
+				return nil, fmt.Errorf("failed to insert decision number: %w", err)
+			}
+			decisionsCount++
+		}
+	}
+
+	if err := existingRows.Err(); err != nil {
+		txn.Rollback()
+		return nil, fmt.Errorf("error iterating existing decision numbers: %w", err)
+	}
+
+	if err := txn.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	logger.Debugf("Found %d decision numbers with English summaries", decisionsCount)
+
+	// Get extractions that don't have English summaries yet
+	extractionsQuery := `
 		SELECT e.id
 		FROM extraction e
 		WHERE e.raw_page_link LIKE 'https://putusan3.mahkamahagung.go.id%'
+		AND NOT EXISTS (
+			SELECT 1
+			FROM temp_processed_decisions t
+			WHERE t.decision_number = e.metadata->>'number'
+		)
 		LIMIT $1
 	`
 
-	rows, err := d.crawlerDb.Query(query, batchSize)
+	rows, err := d.crawlerDb.Query(extractionsQuery, batchSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute query: %w", err)
+		return nil, fmt.Errorf("failed to execute extraction query: %w", err)
 	}
 	defer rows.Close()
 
@@ -101,17 +174,15 @@ func (d *Database) GetExtractionIDs(batchSize int) ([]ExtractionID, error) {
 	for rows.Next() {
 		var ex ExtractionID
 		if err := rows.Scan(&ex.ID); err != nil {
-			logger.Errorf("Failed to scan row: %v", err)
-			return nil, fmt.Errorf("failed to scan row: %w", err)
+			return nil, fmt.Errorf("failed to scan extraction ID: %w", err)
 		}
 		extractions = append(extractions, ex)
 	}
 
 	if err := rows.Err(); err != nil {
-		logger.Errorf("Error iterating rows: %v", err)
-		return nil, fmt.Errorf("error iterating rows: %w", err)
+		return nil, fmt.Errorf("error iterating extraction rows: %w", err)
 	}
 
-	logger.Debugf("Found %d extraction IDs", len(extractions))
+	logger.Debugf("Found %d extraction IDs without English summaries", len(extractions))
 	return extractions, nil
 }
