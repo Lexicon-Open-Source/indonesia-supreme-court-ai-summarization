@@ -312,18 +312,19 @@ async def run_pull_job_consumer_improved(
 
             # Fetch and process messages with improved error handling
             try:
-                # Use fetch instead of an iterator to have better control
-                logger.debug(f"{consumer_name} Fetching batch of messages (max 1)...")
-                messages = await jetstream_client.fetch(
-                    stream=consumer_config.filter_subject.split('.')[0],
+                # Use pull_subscribe instead of fetch
+                logger.debug(f"{consumer_name} Setting up pull subscription...")
+                subscription = await jetstream_client.pull_subscribe(
+                    subject=consumer_config.filter_subject,
                     durable=consumer_config.durable_name,
-                    batch=1,
-                    expires=30  # 30 seconds timeout
                 )
 
-                msg_count = 0
-                async for msg in messages:
-                    msg_count += 1
+                # Pull messages in batches
+                logger.debug(f"{consumer_name} Pulling batch of messages (max 1)...")
+                messages = await subscription.fetch(batch=1, timeout=30)
+
+                msg_count = len(messages)
+                for msg in messages:
                     logger.info(f"{consumer_name} Processing message {msg.metadata.stream_seq}")
 
                     # Process the message with timeout protection
