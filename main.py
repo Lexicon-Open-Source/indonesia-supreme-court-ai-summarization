@@ -2,10 +2,13 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from collections.abc import AsyncGenerator
+from collections import deque
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Annotated
+from typing import Annotated, Dict
+from statistics import mean, median
 
 from fastapi import Depends, FastAPI
 from fastapi.exceptions import HTTPException
@@ -62,6 +65,54 @@ class SummarizationRequest(BaseModel):
 
 
 CONTEXTS = AppContexts()
+
+# Store recent processing times to calculate estimates (in seconds)
+# Using a deque with maxlen to automatically drop old values
+PROCESSING_TIMES = {
+    "total": deque(maxlen=100),  # Store last 100 total processing times
+    "extraction": deque(maxlen=100),  # Store last 100 extraction times
+    "db_write": deque(maxlen=100),  # Store last 100 DB write times
+}
+
+def get_time_estimate() -> Dict[str, float]:
+    """
+    Calculate time estimates based on historical processing times.
+    Returns a dictionary with estimated durations for each processing stage.
+    """
+    estimates = {}
+
+    # If we have enough data, use median (more robust to outliers)
+    # Otherwise fall back to mean or default values
+    if len(PROCESSING_TIMES["total"]) >= 5:
+        estimates["total"] = median(PROCESSING_TIMES["total"])
+    elif len(PROCESSING_TIMES["total"]) > 0:
+        estimates["total"] = mean(PROCESSING_TIMES["total"])
+    else:
+        estimates["total"] = 60.0  # Default estimate of 60 seconds
+
+    if len(PROCESSING_TIMES["extraction"]) >= 5:
+        estimates["extraction"] = median(PROCESSING_TIMES["extraction"])
+    elif len(PROCESSING_TIMES["extraction"]) > 0:
+        estimates["extraction"] = mean(PROCESSING_TIMES["extraction"])
+    else:
+        estimates["extraction"] = 45.0  # Default estimate
+
+    if len(PROCESSING_TIMES["db_write"]) >= 5:
+        estimates["db_write"] = median(PROCESSING_TIMES["db_write"])
+    elif len(PROCESSING_TIMES["db_write"]) > 0:
+        estimates["db_write"] = mean(PROCESSING_TIMES["db_write"])
+    else:
+        estimates["db_write"] = 5.0  # Default estimate
+
+    return estimates
+
+def update_processing_times(stage: str, duration: float) -> None:
+    """
+    Update the historical processing times for a specific stage.
+    """
+    if stage in PROCESSING_TIMES:
+        PROCESSING_TIMES[stage].append(duration)
+        logger.debug(f"Updated {stage} time statistics: count={len(PROCESSING_TIMES[stage])}, latest={duration:.2f}s")
 
 
 @asynccontextmanager
@@ -162,9 +213,26 @@ async def generate_summary(msg: Msg) -> None:
     global CONTEXTS
     print("DIRECT LOG: Starting generate_summary for NATS message", flush=True)
     logger.info("Starting generate_summary for NATS message")
+
+    # Start timing the entire process
+    total_start_time = asyncio.get_event_loop().time()
+    extraction_id = None
+
     try:
+        # Timing: Context initialization
+        context_start_time = asyncio.get_event_loop().time()
         contexts = await CONTEXTS.get_app_contexts(init_nats=True)
+        context_end_time = asyncio.get_event_loop().time()
+        context_duration = context_end_time - context_start_time
+        logger.info(f"AppContexts initialization took {context_duration:.2f} seconds")
+
+        # Timing: Message decoding
+        decode_start_time = asyncio.get_event_loop().time()
         data = json.loads(msg.data.decode())
+        decode_end_time = asyncio.get_event_loop().time()
+        decode_duration = decode_end_time - decode_start_time
+        logger.debug(f"Message decoding took {decode_duration:.2f} seconds")
+
         print(f"DIRECT LOG: Processing summarization request: {data}", flush=True)
         logger.info(f"Processing summarization request: {data}")
 
@@ -179,6 +247,9 @@ async def generate_summary(msg: Msg) -> None:
         try:
             print(f"DIRECT LOG: Extracting and reformatting summary for extraction_id: {extraction_id}", flush=True)
             logger.info(f"Extracting and reformatting summary for extraction_id: {extraction_id}")
+
+            # Timing: Summary extraction
+            extract_start_time = asyncio.get_event_loop().time()
             (
                 summary,
                 translated_summary,
@@ -188,14 +259,28 @@ async def generate_summary(msg: Msg) -> None:
                 crawler_db_engine=contexts.crawler_db_engine,
                 case_db_engine=contexts.case_db_engine,
             )
+            extract_end_time = asyncio.get_event_loop().time()
+            extract_duration = extract_end_time - extract_start_time
+            logger.info(f"Summary extraction for {extraction_id} took {extract_duration:.2f} seconds")
+            # Store extraction time for future estimates
+            update_processing_times("extraction", extract_duration)
 
             print(f"DIRECT LOG: Sanitizing summary data for decision number: {decision_number}", flush=True)
             logger.info(f"Sanitizing summary data for decision number: {decision_number}")
+
+            # Timing: Sanitization
+            sanitize_start_time = asyncio.get_event_loop().time()
             summary_text = sanitize_markdown_symbol(summary)
             translated_summary_text = sanitize_markdown_symbol(translated_summary)
+            sanitize_end_time = asyncio.get_event_loop().time()
+            sanitize_duration = sanitize_end_time - sanitize_start_time
+            logger.debug(f"Summary sanitization took {sanitize_duration:.2f} seconds")
 
             print(f"DIRECT LOG: Updating database with summary for decision number: {decision_number}", flush=True)
             logger.info(f"Updating database with summary for decision number: {decision_number}")
+
+            # Timing: Database write
+            db_write_start_time = asyncio.get_event_loop().time()
             await write_summary_to_db(
                 case_db_engine=contexts.case_db_engine,
                 decision_number=decision_number,
@@ -204,6 +289,11 @@ async def generate_summary(msg: Msg) -> None:
                 translated_summary=translated_summary,
                 translated_summary_text=translated_summary_text,
             )
+            db_write_end_time = asyncio.get_event_loop().time()
+            db_write_duration = db_write_end_time - db_write_start_time
+            logger.info(f"Database write for decision {decision_number} took {db_write_duration:.2f} seconds")
+            # Store DB write time for future estimates
+            update_processing_times("db_write", db_write_duration)
 
             print(f"DIRECT LOG: Successfully processed summarization for decision number: {decision_number}", flush=True)
             logger.info(f"Successfully processed summarization for decision number: {decision_number}")
@@ -233,6 +323,13 @@ async def generate_summary(msg: Msg) -> None:
         # For critical errors, we should not ack (let NATS retry delivery)
         await msg.ack()  # Still ack to avoid stuck messages
     finally:
+        # Calculate and log total processing time
+        total_end_time = asyncio.get_event_loop().time()
+        total_duration = total_end_time - total_start_time
+        logger.info(f"Total processing time for message {extraction_id or 'unknown'}: {total_duration:.2f} seconds")
+        # Store total time for future estimates
+        if extraction_id:  # Only store successful runs
+            update_processing_times("total", total_duration)
         sys.stdout.flush()
 
 
@@ -285,6 +382,16 @@ async def submit_summarization_job(
         logger.debug(f"Message to publish: {json_payload}")
 
         logger.info(f"Publishing summarization job for extraction_id: {extraction_id}")
+
+        # Get time estimate before publishing job
+        time_estimates = get_time_estimate()
+        estimated_total_seconds = time_estimates["total"]
+        estimated_minutes = int(estimated_total_seconds // 60)
+        estimated_seconds = int(estimated_total_seconds % 60)
+
+        logger.info(f"Estimated processing time for extraction_id {extraction_id}: {estimated_minutes}m {estimated_seconds}s")
+
+        # Submit the job
         ack = await js.publish(SUBJECT, json_payload.encode())
         logger.info(f"Successfully submitted summarization job: {payload}, ack: {ack}")
 
@@ -303,4 +410,10 @@ async def submit_summarization_job(
             detail=f"Failed to process summarization request: {str(e)}"
         )
 
-    return {"data": "success"}
+    # Return success response with the time estimate
+    time_estimates = get_time_estimate()
+    return {
+        "data": "success",
+        "estimated_processing_time_seconds": time_estimates["total"],
+        "estimated_completion_time": time.time() + time_estimates["total"]
+    }

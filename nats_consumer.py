@@ -318,6 +318,9 @@ async def run_pull_job_consumer_improved(
 
             # Fetch and process messages with improved error handling
             try:
+                # Record fetch start time
+                fetch_start_time = asyncio.get_event_loop().time()
+
                 # Use pull_subscribe instead of fetch
                 logger.debug(f"{worker_name} Setting up pull subscription...")
                 subscription = await jetstream_client.pull_subscribe(
@@ -330,8 +333,18 @@ async def run_pull_job_consumer_improved(
                 logger.debug(f"{worker_name} Pulling batch of messages (max 1)...")
                 messages = await subscription.fetch(batch=1, timeout=30)
 
+                # Record fetch end time
+                fetch_end_time = asyncio.get_event_loop().time()
+                fetch_duration = fetch_end_time - fetch_start_time
+
                 msg_count = len(messages)
+                if msg_count > 0:
+                    logger.info(f"{worker_name} Received {msg_count} message(s) in {fetch_duration:.2f} seconds")
+
                 for msg in messages:
+                    # Record processing start time
+                    processing_start_time = asyncio.get_event_loop().time()
+
                     # Use a safer way to log the message ID that works across versions
                     # In newer versions, the sequence number is available differently
                     try:
@@ -343,20 +356,30 @@ async def run_pull_job_consumer_improved(
                             msg_id = "unknown"
                         logger.info(f"{worker_name} Processing message {msg_id}")
                     except Exception as e:
+                        msg_id = "unknown"
                         logger.info(f"{worker_name} Processing message (could not determine sequence: {e})")
 
                     # Process the message with timeout protection
                     try:
                         # We don't use a timeout here because the processing function should handle its own timeouts
                         await processing_func(msg)
-                        logger.info(f"{worker_name} Successfully processed message")
+
+                        # Record processing end time
+                        processing_end_time = asyncio.get_event_loop().time()
+                        processing_duration = processing_end_time - processing_start_time
+
+                        logger.info(f"{worker_name} Successfully processed message {msg_id} in {processing_duration:.2f} seconds")
                     except Exception as processing_error:
-                        logger.error(f"{worker_name} Error processing message: {processing_error}")
+                        # Record error time
+                        error_time = asyncio.get_event_loop().time()
+                        processing_duration = error_time - processing_start_time
+
+                        logger.error(f"{worker_name} Error processing message {msg_id} after {processing_duration:.2f} seconds: {processing_error}")
                         # The processing function should handle its own ack/nack
 
                 if msg_count == 0:
                     # No messages received, wait briefly before fetching again
-                    logger.debug(f"{worker_name} No messages received, waiting before next fetch")
+                    logger.debug(f"{worker_name} No messages received in {fetch_duration:.2f} seconds, waiting before next fetch")
                     await asyncio.sleep(1)
 
             except nats.errors.TimeoutError:
