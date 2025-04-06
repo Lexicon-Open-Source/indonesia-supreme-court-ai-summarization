@@ -161,9 +161,13 @@ async def error_callback(error: Exception) -> None:
     Args:
         error: The error that occurred.
     """
-    if not isinstance(error, nats.errors.SlowConsumerError):
+    if isinstance(error, nats.errors.SlowConsumerError):
+        logger.warning(f"NATS slow consumer error (can be normal during heavy processing): {error}")
+    else:
         logger.warning(f"NATS client got error: {error}")
-        await asyncio.sleep(DEFAULT_TIMEOUT_INTERVAL)
+
+    # Always sleep a bit to prevent tight error loops
+    await asyncio.sleep(DEFAULT_TIMEOUT_INTERVAL)
 
 
 def create_job_consumer_async_task(
@@ -248,101 +252,110 @@ async def run_pull_job_consumer_improved(
         None
     """
     consumer_name = f"consumer-{consumer_id}"
-    logger = logging.getLogger(f"nats-{consumer_name}")
+    logger.info(f"Starting {consumer_name} using pull-based subscription with consumer config: {consumer_config.durable_name}")
 
-    # Setup subscription with proper error handling
-    retry_count = 0
-    max_retries = 10
-    base_retry_delay = 1
-
-    logger.info(f"Starting NATS {consumer_name} for subject {consumer_config.filter_subject}")
+    # Initialization of local variables
+    consumerInfo = None
+    max_reconnect_attempts = 5
+    reconnect_delay = 2  # seconds
+    reconnect_attempts = 0
 
     while True:
         try:
             if not nats_client.is_connected:
-                logger.warning(f"{consumer_name}: NATS client disconnected, reconnecting...")
-                nats_client = await initialize_nats()
-                jetstream_client = nats_client.jetstream()
-
-                # Ensure stream exists
-                stream_configs = generate_nats_stream_configs()
-                await initialize_jetstream_client(
-                    nats_client=nats_client,
-                    stream_configs=stream_configs,
-                )
-
-            # Create a pull subscription
-            logger.info(f"{consumer_name}: Creating pull subscriber for {consumer_config.filter_subject} with durable {consumer_config.durable_name}")
-
-            try:
-                # Get existing consumer info
-                consumer_info = await jetstream_client.consumer_info(
-                    STREAM_NAME, consumer_config.durable_name
-                )
-                logger.debug(f"{consumer_name}: Found existing consumer: {consumer_info}")
-            except Exception as e:
-                if "consumer not found" in str(e).lower():
-                    logger.debug(f"{consumer_name}: Consumer {consumer_config.durable_name} not found, will be created")
-                else:
-                    logger.warning(f"{consumer_name}: Error getting consumer info: {e}")
-
-            subscription = await jetstream_client.pull_subscribe(
-                subject=consumer_config.filter_subject,
-                durable=consumer_config.durable_name,
-                config=consumer_config,
-            )
-
-            # Reset retry count on success
-            retry_count = 0
-
-            logger.info(f"{consumer_name}: Running pull-based subscription for {consumer_config.filter_subject}")
-
-            # Process messages in a loop
-            while nats_client.is_connected:
+                logger.warning(f"{consumer_name} NATS client disconnected, attempting to reconnect...")
                 try:
-                    # Fetch messages in batches
-                    logger.debug(f"{consumer_name}: Fetching messages...")
-                    msgs = await subscription.fetch(batch=10, timeout=1)
-                    if msgs:
-                        logger.info(f"{consumer_name}: Received {len(msgs)} messages")
-                        for msg in msgs:
-                            try:
-                                logger.debug(f"{consumer_name}: Processing message: {msg.data[:100]}...")
-                                await processing_func(msg)
-                            except Exception as proc_err:
-                                logger.error(f"{consumer_name}: Error processing message: {proc_err}")
-                                # Only acknowledge explicitly processed messages
-                                await msg.ack()
+                    # Attempt to reconnect if disconnected
+                    if reconnect_attempts < max_reconnect_attempts:
+                        reconnect_attempts += 1
+                        logger.info(f"{consumer_name} Reconnecting to NATS (attempt {reconnect_attempts}/{max_reconnect_attempts})")
+                        await nats_client.connect(
+                            get_settings().nats__url,
+                            error_cb=error_callback,
+                            reconnect_time_wait=2,
+                            max_reconnect_attempts=10,
+                            connect_timeout=10,
+                        )
+                        # Get a new jetstream client after reconnection
+                        jetstream_client = nats_client.jetstream()
+                        logger.info(f"{consumer_name} Successfully reconnected to NATS")
+                        reconnect_attempts = 0  # Reset the counter on successful reconnection
                     else:
-                        logger.debug(f"{consumer_name}: No messages received in fetch call")
-                except asyncio.TimeoutError:
-                    # This is expected, just continue polling
-                    logger.debug(f"{consumer_name}: Fetch timeout (normal)")
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"{consumer_name}: Error in message batch processing: {e}")
+                        logger.error(f"{consumer_name} Max reconnection attempts reached. Sleeping before retry...")
+                        await asyncio.sleep(30)  # Longer delay before trying to reconnect again
+                        reconnect_attempts = 0  # Reset counter to try again
+                        continue
+                except Exception as reconnect_error:
+                    logger.error(f"{consumer_name} Failed to reconnect to NATS: {reconnect_error}")
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, 30)  # Exponential backoff capped at 30 seconds
+                    continue
+
+            # Check/add consumer if it doesn't exist
+            try:
+                consumerInfo = await jetstream_client.consumer_info(
+                    stream=consumer_config.filter_subject.split('.')[0],
+                    consumer=consumer_config.durable_name,
+                )
+                logger.debug(f"{consumer_name} Consumer exists: {consumer_config.durable_name}")
+            except nats.js.errors.NotFoundError:
+                logger.info(f"{consumer_name} Creating consumer: {consumer_config.durable_name}")
+                consumerInfo = await jetstream_client.add_consumer(
+                    stream=consumer_config.filter_subject.split('.')[0],
+                    config=consumer_config
+                )
+                logger.info(f"{consumer_name} Created consumer: {consumer_config.durable_name}")
+            except Exception as consumer_error:
+                logger.error(f"{consumer_name} Error checking/creating consumer: {consumer_error}")
+                await asyncio.sleep(2)
+                continue
+
+            # Fetch and process messages with improved error handling
+            try:
+                # Use fetch instead of an iterator to have better control
+                logger.debug(f"{consumer_name} Fetching batch of messages (max 1)...")
+                messages = await jetstream_client.fetch(
+                    stream=consumer_config.filter_subject.split('.')[0],
+                    durable=consumer_config.durable_name,
+                    batch=1,
+                    expires=30  # 30 seconds timeout
+                )
+
+                msg_count = 0
+                async for msg in messages:
+                    msg_count += 1
+                    logger.info(f"{consumer_name} Processing message {msg.metadata.stream_seq}")
+
+                    # Process the message with timeout protection
+                    try:
+                        # We don't use a timeout here because the processing function should handle its own timeouts
+                        await processing_func(msg)
+                        logger.info(f"{consumer_name} Successfully processed message {msg.metadata.stream_seq}")
+                    except Exception as processing_error:
+                        logger.error(f"{consumer_name} Error processing message: {processing_error}")
+                        # The processing function should handle its own ack/nack
+
+                if msg_count == 0:
+                    # No messages received, wait briefly before fetching again
+                    logger.debug(f"{consumer_name} No messages received, waiting before next fetch")
                     await asyncio.sleep(1)
 
-            # If we get here, the connection was lost
-            logger.warning(f"{consumer_name}: NATS connection lost")
-            try:
-                await subscription.unsubscribe()
-            except:
-                pass
+            except nats.errors.TimeoutError:
+                logger.debug(f"{consumer_name} Timeout waiting for messages, will retry")
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                logger.info(f"{consumer_name} Task was cancelled, exiting")
+                raise
+            except Exception as fetch_error:
+                logger.error(f"{consumer_name} Error fetching messages: {fetch_error}")
+                await asyncio.sleep(3)  # Wait before retry
 
+        except asyncio.CancelledError:
+            logger.info(f"{consumer_name} Task was cancelled, exiting")
+            raise
         except Exception as e:
-            retry_count += 1
-            # Calculate exponential backoff delay
-            retry_delay = min(base_retry_delay * (2 ** (retry_count - 1)), 30)
-
-            logger.error(f"{consumer_name}: Subscription error: {e}, retrying in {retry_delay}s (attempt {retry_count}/{max_retries})")
-
-            if retry_count >= max_retries:
-                logger.error(f"{consumer_name}: Reached maximum retry attempts ({max_retries}), waiting longer")
-                await asyncio.sleep(60)
-                retry_count = 0
-            else:
-                await asyncio.sleep(retry_delay)
+            logger.error(f"{consumer_name} Unexpected error in consumer loop: {e}")
+            await asyncio.sleep(5)  # Wait before restarting the loop
 
 
 async def close_nats_connection(connection_task: asyncio.Task) -> None:
