@@ -325,13 +325,24 @@ async def run_pull_job_consumer_improved(
 
                 msg_count = len(messages)
                 for msg in messages:
-                    logger.info(f"{consumer_name} Processing message {msg.metadata.stream_seq}")
+                    # Use a safer way to log the message ID that works across versions
+                    # In newer versions, the sequence number is available differently
+                    try:
+                        if hasattr(msg, 'metadata') and hasattr(msg.metadata, 'sequence'):
+                            msg_id = msg.metadata.sequence
+                        elif hasattr(msg, 'metadata') and hasattr(msg.metadata, 'stream_seq'):
+                            msg_id = msg.metadata.stream_seq
+                        else:
+                            msg_id = "unknown"
+                        logger.info(f"{consumer_name} Processing message {msg_id}")
+                    except Exception as e:
+                        logger.info(f"{consumer_name} Processing message (could not determine sequence: {e})")
 
                     # Process the message with timeout protection
                     try:
                         # We don't use a timeout here because the processing function should handle its own timeouts
                         await processing_func(msg)
-                        logger.info(f"{consumer_name} Successfully processed message {msg.metadata.stream_seq}")
+                        logger.info(f"{consumer_name} Successfully processed message")
                     except Exception as processing_error:
                         logger.error(f"{consumer_name} Error processing message: {processing_error}")
                         # The processing function should handle its own ack/nack
