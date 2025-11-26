@@ -12,6 +12,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Query
 from fastapi.exceptions import HTTPException
+from fastapi.security import APIKeyHeader
 from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
 from pydantic import BaseModel, Field
@@ -160,6 +161,36 @@ def update_processing_times(stage: str, duration: float) -> None:
     if stage in PROCESSING_TIMES:
         PROCESSING_TIMES[stage].append(duration)
         logger.debug(f"Updated {stage} time: {duration:.2f}s")
+
+
+# =============================================================================
+# API Key Authentication
+# =============================================================================
+
+API_KEY_HEADER = APIKeyHeader(name="X-LEXICON-API-KEY", auto_error=False)
+
+
+async def verify_api_key(
+    api_key: Annotated[str | None, Depends(API_KEY_HEADER)],
+) -> str:
+    """
+    Verify the API key from X-LEXICON-API-KEY header.
+
+    All requests (except /health) require a valid API key.
+    """
+    if not api_key:
+        raise HTTPException(
+            status_code=HTTPStatus.UNAUTHORIZED,
+            detail="Missing X-LEXICON-API-KEY header",
+        )
+
+    if api_key != get_settings().lexicon_api_key:
+        raise HTTPException(
+            status_code=HTTPStatus.UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+    return api_key
 
 
 # =============================================================================
@@ -351,6 +382,7 @@ async def health_check(
 async def submit_extraction(
     payload: ExtractionRequest,
     app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> JobSubmitResponse:
     """
     Submit extraction job to NATS queue for processing.
@@ -430,6 +462,7 @@ async def submit_extraction(
 async def get_extraction(
     extraction_id: str,
     app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> ExtractionResponse:
     """Get extraction result by extraction_id."""
     async_session = async_sessionmaker(
@@ -469,6 +502,7 @@ async def get_extraction(
 async def get_extraction_status(
     extraction_id: str,
     app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> ExtractionStatusResponse:
     """Get extraction status by extraction_id."""
     async_session = async_sessionmaker(
@@ -510,6 +544,7 @@ async def get_extraction_status(
 )
 async def list_extractions(
     app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
     status: str | None = Query(None, description="Filter by status"),
     limit: int = Query(20, ge=1, le=100, description="Number of results"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
@@ -562,6 +597,7 @@ async def list_extractions(
 async def delete_extraction(
     extraction_id: str,
     app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict:
     """Delete an extraction record."""
     async_session = async_sessionmaker(
@@ -634,6 +670,7 @@ async def get_pending_extraction_ids(
 async def submit_batch_extraction_async(
     payload: BatchExtractionRequest,
     app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> BatchExtractionResponse:
     """
     Submit all pending extractions to NATS queue for processing.
@@ -727,6 +764,7 @@ async def submit_batch_extraction_async(
 )
 async def get_pending_count(
     app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict:
     """Get the number of extractions pending LLM processing."""
     pending_ids = await get_pending_extraction_ids(

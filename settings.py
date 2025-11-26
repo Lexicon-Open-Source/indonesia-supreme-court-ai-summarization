@@ -19,6 +19,7 @@ _temp_credentials_file: str | None = None
 
 class Settings(BaseSettings):
     gemini_api_key: str
+    lexicon_api_key: str  # API key for X-LEXICON-API-KEY header auth (required)
 
     # Crawler database (bo_crawler_v1 schema)
     crawler_db_addr: str
