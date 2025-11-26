@@ -869,7 +869,7 @@ Analysis of legal entities (organizations, companies, institutions) involved in 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `person_name` | string | Nama orang yang berafiliasi |
+| `person_name` | string | Nama orang atau pihak yang berafiliasi |
 | `related_entity_id` | string | ID entitas terkait (merujuk ke entity_registry.id) |
 | `position` | string | Jabatan/posisi dalam entitas (Direktur/Kepala/Auditor/dll) |
 | `nature_of_relationship` | string | Sifat hubungan (Struktural/Kepemilikan/Penugasan Resmi/dll) |

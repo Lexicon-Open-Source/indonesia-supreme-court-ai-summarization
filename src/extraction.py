@@ -844,7 +844,7 @@ class PersonalPlea(BaseModel):
     """Personal plea from defendant."""
 
     filed: bool | None = Field(
-        default=False, description="Apakah pembelaan pribadi diajukan"
+        default=None, description="Apakah pembelaan pribadi diajukan"
     )
     summary: str | None = Field(
         default=None,
@@ -868,7 +868,7 @@ class LegalCounselPlea(BaseModel):
     """Legal counsel's plea (pledoi)."""
 
     filed: bool | None = Field(
-        default=False, description="Apakah pledoi pengacara diajukan"
+        default=None, description="Apakah pledoi pengacara diajukan"
     )
     summary: str | None = Field(
         default=None, description="Ringkasan pembelaan yuridis dari pengacara"
@@ -981,7 +981,7 @@ class AffiliationMapItem(BaseModel):
     """Person-to-entity affiliation mapping."""
 
     person_name: str | None = Field(
-        default=None, description="Nama orang yang berafiliasi"
+        default=None, description="Nama orang atau pihak yang berafiliasi"
     )
     related_entity_id: str | None = Field(
         default=None,
@@ -1251,7 +1251,7 @@ The output must be a valid JSON object with this structure:
             "argument": "string or null"
           }
         ],
-        "specific_requests": ["Vrijspraak/Onslag/Keringanan/Pengembalian aset"]
+        "specific_requests": ["string"]
       }
     },
     "rejoinders": {
