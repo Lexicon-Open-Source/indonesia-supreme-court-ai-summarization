@@ -63,11 +63,13 @@ The `extraction_result` JSONB column stores the structured output with nested ob
   "court_personnel": { ... },
   "indictment": { ... },
   "prosecution_demand": { ... },
+  "defense_strategy": { ... },
   "legal_facts": { ... },
   "judicial_considerations": { ... },
   "verdict": { ... },
   "state_loss": { ... },
   "case_metadata": { ... },
+  "legal_entity_analysis": { ... },
   "additional_case_data": { ... },
   "extraction_confidence": 0.95
 }
@@ -332,7 +334,171 @@ Prosecutor's sentencing demands.
 
 ---
 
-### 7. Legal Facts (`legal_facts`)
+### 7. Defense Strategy (`defense_strategy`)
+
+Complete defense strategy including exceptions, pleas, and rejoinders.
+
+```json
+{
+  "defense_strategy": {
+    "exception": {
+      "filed": true,
+      "date": "2023-10-15",
+      "summary": "Terdakwa mengajukan eksepsi terkait kompetensi pengadilan...",
+      "primary_arguments": [
+        {
+          "type": "competence",
+          "description": "Pengadilan tidak berwenang mengadili",
+          "details": "Apakah pengadilan berwenang mengadili? (Kompetensi Relatif/Absolut)"
+        },
+        {
+          "type": "indictment_validity",
+          "description": "Dakwaan kabur (Obscuur Libel)",
+          "details": "Apakah dakwaan kabur (Obscuur Libel) atau cacat formil?"
+        },
+        {
+          "type": "procedure",
+          "description": "Penyidikan tidak sah",
+          "details": "Apakah penyidikan sah sesuai KUHAP?"
+        }
+      ],
+      "prosecutor_response": {
+        "date": "2023-10-22",
+        "summary": "JPU menolak seluruh dalil eksepsi terdakwa..."
+      },
+      "court_interlocutory_ruling": {
+        "date": "2023-10-29",
+        "decision": "Ditolak",
+        "reasoning": "Majelis Hakim berpendapat eksepsi tidak beralasan hukum..."
+      }
+    },
+    "plea": {
+      "date": "2023-12-20",
+      "submitted_by": ["Terdakwa", "Penasihat Hukum"],
+      "personal_plea": {
+        "filed": true,
+        "summary": "Terdakwa memohon keringanan hukuman karena tulang punggung keluarga dan menyesali perbuatannya"
+      },
+      "legal_counsel_plea": {
+        "filed": true,
+        "summary": "Penasihat hukum memohon pembebasan karena unsur tidak terpenuhi",
+        "key_arguments": [
+          {
+            "point": "unsur_melawan_hukum",
+            "argument": "Perbuatan terdakwa tidak memenuhi unsur melawan hukum karena..."
+          },
+          {
+            "point": "unsur_memperkaya_diri",
+            "argument": "Tidak ada bukti terdakwa memperkaya diri sendiri..."
+          },
+          {
+            "point": "procedural_flaws",
+            "argument": "Terdapat cacat prosedur dalam penyidikan..."
+          }
+        ],
+        "specific_requests": [
+          "Membebaskan Terdakwa dari segala dakwaan (Vrijspraak)",
+          "Melepaskan Terdakwa dari segala tuntutan hukum (Onslag van alle rechtsvervolging)"
+        ]
+      }
+    },
+    "rejoinders": {
+      "replik": {
+        "date": "2023-12-27",
+        "summary": "JPU tetap pada tuntutan semula dan menolak dalil pledoi"
+      },
+      "duplik": {
+        "date": "2024-01-03",
+        "summary": "Penasihat hukum tetap pada pledoi dan menolak replik JPU"
+      }
+    }
+  }
+}
+```
+
+#### Exception Structure (`defense_strategy.exception`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `filed` | boolean | Apakah eksepsi diajukan |
+| `date` | string | Tanggal pengajuan eksepsi (YYYY-MM-DD) |
+| `summary` | string | Ringkasan eksepsi yang diajukan |
+| `primary_arguments` | array | Argumen utama dalam eksepsi |
+| `prosecutor_response` | object | Tanggapan JPU atas eksepsi |
+| `court_interlocutory_ruling` | object | Putusan sela pengadilan |
+
+#### Exception Argument Structure (`defense_strategy.exception.primary_arguments[]`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Jenis argumen (competence/indictment_validity/procedure) |
+| `description` | string | Deskripsi argumen eksepsi |
+| `details` | string | Detail argumen eksepsi |
+
+#### Prosecutor Response Structure (`defense_strategy.exception.prosecutor_response`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `date` | string | Tanggal tanggapan JPU (YYYY-MM-DD) |
+| `summary` | string | Ringkasan tanggapan Penuntut Umum |
+
+#### Interlocutory Ruling Structure (`defense_strategy.exception.court_interlocutory_ruling`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `date` | string | Tanggal putusan sela (YYYY-MM-DD) |
+| `decision` | string | Keputusan putusan sela (Diterima/Ditolak) |
+| `reasoning` | string | Alasan/pertimbangan putusan sela |
+
+#### Plea Structure (`defense_strategy.plea`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `date` | string | Tanggal pengajuan pledoi (YYYY-MM-DD) |
+| `submitted_by` | array | Pihak yang mengajukan pledoi |
+| `personal_plea` | object | Pembelaan pribadi dari terdakwa |
+| `legal_counsel_plea` | object | Pembelaan yuridis dari pengacara |
+
+#### Personal Plea Structure (`defense_strategy.plea.personal_plea`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `filed` | boolean | Apakah pembelaan pribadi diajukan |
+| `summary` | string | Ringkasan pembelaan pribadi terdakwa |
+
+#### Legal Counsel Plea Structure (`defense_strategy.plea.legal_counsel_plea`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `filed` | boolean | Apakah pledoi pengacara diajukan |
+| `summary` | string | Ringkasan pembelaan yuridis |
+| `key_arguments` | array | Argumen utama dalam pledoi |
+| `specific_requests` | array | Permintaan spesifik (Vrijspraak/Onslag/Keringanan) |
+
+#### Plea Argument Structure (`defense_strategy.plea.legal_counsel_plea.key_arguments[]`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `point` | string | Poin argumen (unsur_melawan_hukum/unsur_memperkaya_diri/procedural_flaws) |
+| `argument` | string | Isi argumen |
+
+#### Rejoinders Structure (`defense_strategy.rejoinders`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `replik` | object | Tanggapan Jaksa atas Pledoi |
+| `duplik` | object | Tanggapan balik Pengacara atas Replik |
+
+#### Replik/Duplik Structure (`defense_strategy.rejoinders.replik/duplik`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `date` | string | Tanggal replik/duplik (YYYY-MM-DD) |
+| `summary` | string | Ringkasan tanggapan |
+
+---
+
+### 8. Legal Facts (`legal_facts`)
 
 Categorized legal facts established during trial.
 
@@ -380,7 +546,7 @@ Categorized legal facts established during trial.
 
 ---
 
-### 8. Judicial Considerations (`judicial_considerations`)
+### 9. Judicial Considerations (`judicial_considerations`)
 
 Judge's considerations in sentencing.
 
@@ -406,7 +572,7 @@ Judge's considerations in sentencing.
 
 ---
 
-### 9. Verdict (`verdict`)
+### 10. Verdict (`verdict`)
 
 Final court decision.
 
@@ -516,7 +682,7 @@ Final court decision.
 
 ---
 
-### 10. State Loss (`state_loss`)
+### 11. State Loss (`state_loss`)
 
 Information about state financial loss.
 
@@ -574,7 +740,7 @@ Information about state financial loss.
 
 ---
 
-### 11. Case Metadata (`case_metadata`)
+### 12. Case Metadata (`case_metadata`)
 
 Additional case classification and related cases.
 
@@ -620,7 +786,97 @@ Additional case classification and related cases.
 
 ---
 
-### 12. Additional Case Data (`additional_case_data`)
+### 13. Legal Entity Analysis (`legal_entity_analysis`)
+
+Analysis of legal entities (organizations, companies, institutions) involved in the case and their affiliations with persons.
+
+```json
+{
+  "legal_entity_analysis": {
+    "entity_registry": [
+      {
+        "id": "ENT_01",
+        "name": "SMP Negeri 5 Pallangga",
+        "legal_form": "Instansi Pemerintah",
+        "sector": "Pendidikan",
+        "role_in_case": "Locus Delicti (Tempat Kejadian) & Korban",
+        "address": "Jalan Baso Dg. Mangawing, Kabupaten Gowa"
+      },
+      {
+        "id": "ENT_02",
+        "name": "PT. Heksa Prima Abadi",
+        "legal_form": "Perseroan Terbatas (PT)",
+        "sector": "Swasta / Vendor",
+        "role_in_case": "Penyedia Barang (Buku) - Terindikasi Fiktif/Mark-up"
+      },
+      {
+        "id": "ENT_03",
+        "name": "CV. Karsa Mandiri",
+        "legal_form": "Comanditaire Venootschap (CV)",
+        "sector": "Swasta / Vendor",
+        "role_in_case": "Penyedia Barang (Buku)"
+      },
+      {
+        "id": "ENT_04",
+        "name": "Inspektorat Daerah Kabupaten Gowa",
+        "legal_form": "Lembaga Pemerintah",
+        "sector": "Pengawasan",
+        "role_in_case": "Auditor (Penghitung Kerugian Negara)"
+      }
+    ],
+    "affiliations_map": [
+      {
+        "person_name": "Drs. H. JAMALUDDIN",
+        "related_entity_id": "ENT_01",
+        "position": "Kepala Sekolah / KPA",
+        "nature_of_relationship": "Struktural (Pejabat Berwenang)"
+      },
+      {
+        "person_name": "Saparuddin",
+        "related_entity_id": "ENT_02",
+        "position": "Direktur/Pengurus",
+        "nature_of_relationship": "Kepemilikan & Pengendali"
+      },
+      {
+        "person_name": "Saparuddin",
+        "related_entity_id": "ENT_03",
+        "position": "Direktur/Pengurus",
+        "nature_of_relationship": "Kepemilikan & Pengendali (Indikasi Pinjam Bendera)"
+      },
+      {
+        "person_name": "Tim Audit",
+        "related_entity_id": "ENT_04",
+        "position": "Auditor",
+        "nature_of_relationship": "Penugasan Resmi"
+      }
+    ]
+  }
+}
+```
+
+#### Entity Registry Structure (`legal_entity_analysis.entity_registry[]`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique identifier for the entity (e.g., ENT_01) |
+| `name` | string | Nama entitas/badan hukum |
+| `legal_form` | string | Bentuk hukum (Instansi Pemerintah/PT/CV/Yayasan/dll) |
+| `sector` | string | Sektor entitas (Pendidikan/Swasta/Pengawasan/dll) |
+| `role_in_case` | string | Peran entitas dalam kasus (Locus Delicti/Korban/Vendor/Auditor/dll) |
+| `address` | string | Alamat entitas |
+
+#### Affiliations Map Structure (`legal_entity_analysis.affiliations_map[]`)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `person_name` | string | Nama orang yang berafiliasi |
+| `related_entity_id` | string | ID entitas terkait (merujuk ke entity_registry.id) |
+| `position` | string | Jabatan/posisi dalam entitas (Direktur/Kepala/Auditor/dll) |
+| `nature_of_relationship` | string | Sifat hubungan (Struktural/Kepemilikan/Penugasan Resmi/dll) |
+
+---
+
+### 14. Additional Case Data (`additional_case_data`)
 
 Additional data for complex cases such as appeal cases (banding/kasasi) and multi-stage proceedings.
 
@@ -891,6 +1147,36 @@ Additional data for complex cases such as appeal cases (banding/kasasi) and mult
     "restitution_subsidiary_type": null,
     "restitution_subsidiary_duration_months": null
   },
+  "defense_strategy": {
+    "exception": {
+      "filed": false,
+      "date": null,
+      "summary": null,
+      "primary_arguments": [],
+      "prosecutor_response": null,
+      "court_interlocutory_ruling": null
+    },
+    "plea": {
+      "date": "2023-12-20",
+      "submitted_by": ["Terdakwa", "Penasihat Hukum"],
+      "personal_plea": {
+        "filed": true,
+        "summary": "Terdakwa memohon keringanan hukuman"
+      },
+      "legal_counsel_plea": {
+        "filed": true,
+        "summary": "Penasihat hukum memohon pembebasan",
+        "key_arguments": [
+          { "point": "unsur_melawan_hukum", "argument": "Tidak terbukti unsur melawan hukum" }
+        ],
+        "specific_requests": ["Membebaskan Terdakwa dari segala dakwaan"]
+      }
+    },
+    "rejoinders": {
+      "replik": { "date": "2023-12-27", "summary": "JPU tetap pada tuntutan" },
+      "duplik": { "date": "2024-01-03", "summary": "Penasihat hukum tetap pada pledoi" }
+    }
+  },
   "legal_facts": {
     "organizational_structure": ["..."],
     "standard_procedures": ["..."],
@@ -961,6 +1247,16 @@ Additional data for complex cases such as appeal cases (banding/kasasi) and mult
     "related_cases": [
       { "defendant_name": "ISMAN JAYA NST", "case_number": null, "status": "separate_prosecution", "relationship": "turut serta" },
       { "defendant_name": "INDRA SYAHRIL", "case_number": null, "status": "separate_prosecution", "relationship": "turut serta" }
+    ]
+  },
+  "legal_entity_analysis": {
+    "entity_registry": [
+      { "id": "ENT_01", "name": "BAZNAS Kota Dumai", "legal_form": "Lembaga Negara", "sector": "Pengelolaan Zakat", "role_in_case": "Locus Delicti & Korban", "address": "Jalan Jenderal Sudirman No. 170, Kota Dumai" }
+    ],
+    "affiliations_map": [
+      { "person_name": "ISHAK EFFENDI", "related_entity_id": "ENT_01", "position": "Ketua", "nature_of_relationship": "Struktural (Pejabat Berwenang)" },
+      { "person_name": "INDRA SYAHRIL", "related_entity_id": "ENT_01", "position": "Bendahara Pengeluaran", "nature_of_relationship": "Struktural" },
+      { "person_name": "ISMAN JAYA NST", "related_entity_id": "ENT_01", "position": "Wakil Ketua II", "nature_of_relationship": "Struktural" }
     ]
   },
   "additional_case_data": {
