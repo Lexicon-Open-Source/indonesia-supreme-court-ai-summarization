@@ -711,40 +711,62 @@ async def submit_batch_extraction_async(
         if "already exists" not in str(e):
             logger.warning(f"Stream creation warning: {e}")
 
+    # Use semaphore to limit concurrent operations
+    semaphore = asyncio.Semaphore(payload.concurrency)
     published_count = 0
-    for extraction_id in pending_ids:
-        try:
-            # Create or update PENDING record
-            async with async_session() as session:
-                result = await session.execute(
-                    select(LLMExtraction).where(
-                        LLMExtraction.extraction_id == extraction_id
+    failed_count = 0
+    lock = asyncio.Lock()
+
+    async def process_extraction(extraction_id: str) -> bool:
+        """Process a single extraction: create/update DB record and publish to NATS."""
+        nonlocal published_count, failed_count
+        async with semaphore:
+            try:
+                # Create or update PENDING record
+                async with async_session() as session:
+                    result = await session.execute(
+                        select(LLMExtraction).where(
+                            LLMExtraction.extraction_id == extraction_id
+                        )
                     )
-                )
-                existing = result.scalar_one_or_none()
+                    existing = result.scalar_one_or_none()
 
-                if not existing:
-                    llm_extraction = LLMExtraction(
-                        extraction_id=extraction_id,
-                        status=ExtractionStatus.PENDING.value,
-                    )
-                    session.add(llm_extraction)
-                    await session.commit()
-                else:
-                    # Reset status to PENDING for re-processing
-                    existing.status = ExtractionStatus.PENDING.value
-                    session.add(existing)
-                    await session.commit()
+                    if not existing:
+                        llm_extraction = LLMExtraction(
+                            extraction_id=extraction_id,
+                            status=ExtractionStatus.PENDING.value,
+                        )
+                        session.add(llm_extraction)
+                        await session.commit()
+                    else:
+                        # Reset status to PENDING for re-processing
+                        existing.status = ExtractionStatus.PENDING.value
+                        session.add(existing)
+                        await session.commit()
 
-            # Publish to NATS
-            json_payload = ExtractionRequest(extraction_id=extraction_id).model_dump_json()
-            await js.publish(SUBJECT, json_payload.encode())
-            published_count += 1
+                # Publish to NATS
+                json_payload = ExtractionRequest(
+                    extraction_id=extraction_id
+                ).model_dump_json()
+                await js.publish(SUBJECT, json_payload.encode())
 
-        except Exception as e:
-            logger.error(f"Failed to queue {extraction_id}: {e}")
+                async with lock:
+                    published_count += 1
+                return True
 
-    logger.info(f"Published {published_count}/{len(pending_ids)} extractions to NATS")
+            except Exception as e:
+                logger.error(f"Failed to queue {extraction_id}: {e}")
+                async with lock:
+                    failed_count += 1
+                return False
+
+    # Process all extractions concurrently
+    await asyncio.gather(*[process_extraction(eid) for eid in pending_ids])
+
+    logger.info(
+        f"Published {published_count}/{len(pending_ids)} extractions to NATS "
+        f"(failed: {failed_count})"
+    )
 
     estimates = get_time_estimate()
     estimated_time = len(pending_ids) * estimates["total"]

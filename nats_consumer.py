@@ -205,11 +205,10 @@ def create_job_consumer_async_task(
     consumer_name = DURABLE_NAME
     logger.debug(f"Creating shared consumer with name: {consumer_name}")
 
-    # Create a single consumer config with a delivery group
+    # Create a single consumer config (load balancing happens naturally with pull subscriptions)
     shared_config = ConsumerConfig(
         filter_subject=consumer_config.filter_subject,
         durable_name=consumer_name,
-        deliver_group="summarization_workers",  # This is key for load balancing
         ack_wait=consumer_config.ack_wait,
         max_deliver=consumer_config.max_deliver,
         max_ack_pending=consumer_config.max_ack_pending,
@@ -333,7 +332,6 @@ async def run_pull_job_consumer_improved(
                     subscription = await jetstream_client.pull_subscribe(
                         subject=consumer_config.filter_subject,
                         durable=consumer_config.durable_name,
-                        config=consumer_config,  # Pass the full config to ensure deliver_group is used
                     )
                     logger.info(f"{worker_name} Pull subscription established")
                 except Exception as sub_error:
