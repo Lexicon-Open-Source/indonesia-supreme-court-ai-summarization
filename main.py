@@ -635,7 +635,9 @@ async def get_pending_extraction_ids(
 
     Uses a NOT IN subquery to find extractions without corresponding
     llm_extractions records (with COMPLETED or PROCESSING status).
-    Only includes extractions where raw_page_link starts with 'https://putusan3'.
+    Only includes extractions where:
+    - raw_page_link starts with 'https://putusan3'
+    - artifact_link is not null (PDF must be available)
     """
     async_session = async_sessionmaker(bind=crawler_db_engine, class_=AsyncSession)
 
@@ -651,6 +653,7 @@ async def get_pending_extraction_ids(
         # Main query: get extractions not in the existing subquery
         query = select(Extraction.id).where(
             Extraction.raw_page_link.startswith("https://putusan3"),
+            Extraction.artifact_link.is_not(None),
             Extraction.id.not_in(existing_subquery),
         )
 
@@ -748,7 +751,10 @@ async def submit_batch_extraction_async(
                 json_payload = ExtractionRequest(
                     extraction_id=extraction_id
                 ).model_dump_json()
-                await js.publish(SUBJECT, json_payload.encode())
+                ack = await js.publish(SUBJECT, json_payload.encode())
+                logger.debug(
+                    f"Published {extraction_id} to stream={ack.stream}, seq={ack.seq}"
+                )
 
                 async with lock:
                     published_count += 1
@@ -795,4 +801,97 @@ async def get_pending_count(
     return {
         "pending_count": len(pending_ids),
         "message": f"{len(pending_ids)} extractions pending LLM processing",
+    }
+
+
+@app.post(
+    "/nats/test-publish",
+    tags=["Diagnostics"],
+    summary="Test publishing a single message to NATS",
+)
+async def test_nats_publish(
+    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict:
+    """Test publishing a single message and verify it's stored."""
+    js = app_contexts.nats_client.jetstream()
+
+    test_payload = {"extraction_id": "test-message-123", "test": True}
+
+    try:
+        ack = await js.publish(
+            SUBJECT,
+            json.dumps(test_payload).encode(),
+        )
+        return {
+            "success": True,
+            "ack": {
+                "stream": ack.stream,
+                "seq": ack.seq,
+                "duplicate": ack.duplicate if hasattr(ack, "duplicate") else None,
+            },
+            "subject": SUBJECT,
+            "payload": test_payload,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "subject": SUBJECT,
+        }
+
+
+@app.get(
+    "/nats/diagnostics",
+    tags=["Diagnostics"],
+    summary="Get NATS stream and consumer diagnostics",
+)
+async def get_nats_diagnostics(
+    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict:
+    """Get NATS stream and consumer state for debugging."""
+    js = app_contexts.nats_client.jetstream()
+
+    try:
+        # Get stream info
+        stream_info = await js.stream_info(STREAM_NAME)
+        stream_state = {
+            "name": stream_info.config.name,
+            "subjects": stream_info.config.subjects,
+            "messages": stream_info.state.messages,
+            "bytes": stream_info.state.bytes,
+            "consumer_count": stream_info.state.consumer_count,
+            "first_seq": stream_info.state.first_seq,
+            "last_seq": stream_info.state.last_seq,
+        }
+    except Exception as e:
+        stream_state = {"error": str(e)}
+
+    try:
+        # Get consumer info
+        consumer_info = await js.consumer_info(STREAM_NAME, CONSUMER_CONFIG.durable_name)
+        consumer_state = {
+            "name": consumer_info.name,
+            "durable_name": consumer_info.config.durable_name,
+            "filter_subject": consumer_info.config.filter_subject,
+            "num_pending": consumer_info.num_pending,
+            "num_waiting": consumer_info.num_waiting,
+            "num_ack_pending": consumer_info.num_ack_pending,
+            "num_redelivered": consumer_info.num_redelivered,
+            "delivered_consumer_seq": consumer_info.delivered.consumer_seq,
+            "delivered_stream_seq": consumer_info.delivered.stream_seq,
+        }
+    except Exception as e:
+        consumer_state = {"error": str(e)}
+
+    return {
+        "stream": stream_state,
+        "consumer": consumer_state,
+        "config": {
+            "stream_name": STREAM_NAME,
+            "stream_subjects": STREAM_SUBJECTS,
+            "publish_subject": SUBJECT,
+        },
     }

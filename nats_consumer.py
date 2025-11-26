@@ -303,13 +303,17 @@ async def run_pull_job_consumer_improved(
             # Check/add consumer if it doesn't exist
             try:
                 # Get consumer info to check queue status periodically
+                stream_name = consumer_config.filter_subject.split('.')[0]
                 consumerInfo = await jetstream_client.consumer_info(
-                    stream=consumer_config.filter_subject.split('.')[0],
+                    stream=stream_name,
                     consumer=consumer_config.durable_name,
                 )
                 # Log queue depth periodically
                 num_pending = consumerInfo.num_pending
-                logger.debug(f"{worker_name} Shared consumer exists: {consumer_config.durable_name}, pending messages: {num_pending}")
+                logger.info(
+                    f"{worker_name} Consumer info: pending={num_pending}, "
+                    f"stream={stream_name}, consumer={consumer_config.durable_name}"
+                )
 
             except nats.js.errors.NotFoundError:
                 logger.info(f"{worker_name} Creating shared consumer: {consumer_config.durable_name}")
@@ -344,11 +348,12 @@ async def run_pull_job_consumer_improved(
                 # Record fetch start time
                 fetch_start_time = asyncio.get_event_loop().time()
 
-                # Pull messages - use batch size 1 for sequential processing
-                logger.debug(f"{worker_name} Pulling next message from queue...")
-
                 # Adapt fetch timeout based on queue depth
                 fetch_timeout = 1 if num_pending > 0 else 30
+                logger.info(
+                    f"{worker_name} Fetching messages (timeout={fetch_timeout}s, "
+                    f"pending={num_pending})"
+                )
 
                 messages = await subscription.fetch(batch=1, timeout=fetch_timeout)
 
@@ -408,7 +413,7 @@ async def run_pull_job_consumer_improved(
 
             except nats.errors.TimeoutError:
                 # This is normal when no messages are available
-                logger.debug(f"{worker_name} No messages available in queue, will continue polling")
+                logger.info(f"{worker_name} Fetch timeout - no messages available")
                 await asyncio.sleep(0.1)  # Very short sleep to prevent tight loop
             except asyncio.CancelledError:
                 logger.info(f"{worker_name} Task was cancelled, exiting")
