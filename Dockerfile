@@ -1,35 +1,53 @@
 FROM python:3.10-slim
+
 ENV PYSETUP_PATH="/opt/pysetup" \
-    UV_INSTALL_DIR="/opt/uv"
+    UV_INSTALL_DIR="/opt/uv" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
 ENV PATH=${UV_INSTALL_DIR}/bin:$PATH
 
 WORKDIR $PYSETUP_PATH
 
-# Install system dependencies, UV, and create credential directory in one layer
+# Install system dependencies
 RUN apt-get update && \
-    apt-get install --no-install-recommends -y build-essential \
-    clang curl libgl1 libglib2.0-0 poppler-utils tesseract-ocr tesseract-ocr-ind \
-    ca-certificates python3-dev default-libmysqlclient-dev && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    curl -LsSf https://astral.sh/uv/0.4.29/install.sh | sh && \
-    uv python install 3.10 && \
-    mkdir -p /etc/google/auth && \
-    chmod 700 /etc/google/auth
+    apt-get install --no-install-recommends -y \
+    build-essential \
+    clang \
+    curl \
+    libgl1 \
+    libglib2.0-0 \
+    poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-ind \
+    ca-certificates \
+    python3-dev \
+    default-libmysqlclient-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy service account file
-COPY lexicon-bo-crawler-service-account.json /etc/google/auth/
-RUN chmod 600 /etc/google/auth/lexicon-bo-crawler-service-account.json
+# Install UV
+RUN curl -LsSf https://astral.sh/uv/0.4.29/install.sh | sh && \
+    uv python install 3.10
 
 # Copy application files
-COPY . .
+COPY pyproject.toml uv.lock ./
+COPY src/ ./src/
+COPY main.py cli.py contexts.py settings.py nats_consumer.py entrypoint.sh ./
 
 # Make entrypoint executable
 RUN chmod u+x entrypoint.sh
 
-# Install all dependencies in a single layer
-RUN uv sync
+# Install dependencies
+RUN uv sync --frozen
 
-ARG SERVICE_PORT
+# Expose port
+ARG SERVICE_PORT=8004
 ENV SERVICE_PORT=${SERVICE_PORT}
 EXPOSE ${SERVICE_PORT}
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:${SERVICE_PORT}/health || exit 1
+
 ENTRYPOINT ["./entrypoint.sh"]

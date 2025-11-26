@@ -14,13 +14,15 @@ class AppContexts:
         self.nats_client = None
         self.jetstream_client = None
         self.crawler_db_engine = create_async_engine(
-            f"postgresql+asyncpg://{get_settings().db_user}:{get_settings().db_pass}@{get_settings().db_addr}/lexicon_bo_crawler",
+            f"postgresql+asyncpg://{get_settings().db_user}:{get_settings().db_pass}@{get_settings().db_addr}/postgres",
             future=True,
+            connect_args={"server_settings": {"search_path": "bo_crawler_v1"}},
         )
 
         self.case_db_engine = create_async_engine(
-            f"postgresql+asyncpg://{get_settings().db_user}:{get_settings().db_pass}@{get_settings().db_addr}/lexicon_bo",
+            f"postgresql+asyncpg://{get_settings().db_user}:{get_settings().db_pass}@{get_settings().db_addr}/postgres",
             future=True,
+            connect_args={"server_settings": {"search_path": "bo_v1"}},
         )
 
     async def get_app_contexts(self, init_nats: bool = True) -> "AppContexts":

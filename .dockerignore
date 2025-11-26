@@ -1,1 +1,4 @@
 .venv
+*.json.bak
+*-service-account.json
+*service-account*.json

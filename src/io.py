@@ -8,8 +8,7 @@ from urllib.parse import urlparse
 
 import aiofiles
 from httpx import AsyncClient
-from sqlalchemy.engine.base import Engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlmodel import Column, Field, SQLModel, String, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import (
@@ -60,6 +59,7 @@ except ImportError:
 
 
 class Extraction(SQLModel, table=True):
+    __tablename__ = "extractions"
     id: str = Field(primary_key=True)
     artifact_link: str
     raw_page_link: str
@@ -84,13 +84,13 @@ class Cases(SQLModel, table=True):
     retry=retry_if_not_exception_type((ValueError, NotImplementedError)),
 )
 async def get_extraction_db_data_and_validate(
-    extraction_id: str, crawler_db_engine: Engine, case_db_engine: Engine
+    extraction_id: str, crawler_db_engine: AsyncEngine, case_db_engine: AsyncEngine
 ) -> tuple[Extraction, Cases]:
     logging.info(f"Validating extraction data for ID: {extraction_id}")
     try:
         # Query crawler database
         logging.debug(f"Querying crawler database for extraction ID: {extraction_id}")
-        async_crawler_db_session = sessionmaker(bind=crawler_db_engine, class_=AsyncSession)
+        async_crawler_db_session = async_sessionmaker(bind=crawler_db_engine, class_=AsyncSession)
         async with async_crawler_db_session() as session:
             result_iterator = await session.execute(
                 select(Extraction).where(Extraction.id == extraction_id)
@@ -121,7 +121,7 @@ async def get_extraction_db_data_and_validate(
 
         # Query case database
         logging.debug(f"Querying case database for decision number: {decision_number}")
-        async_case_db_session = sessionmaker(bind=case_db_engine, class_=AsyncSession)
+        async_case_db_session = async_sessionmaker(bind=case_db_engine, class_=AsyncSession)
         async with async_case_db_session() as session:
             result_iterator = await session.execute(
                 select(Cases).where(Cases.decision_number == decision_number)
@@ -657,7 +657,7 @@ async def read_pdf_from_uri(uri_path: str) -> tuple[dict[int, str], int]:
 
 
 async def write_summary_to_db(
-    case_db_engine: Engine,
+    case_db_engine: AsyncEngine,
     decision_number: str,
     summary: str,
     summary_text: str,
@@ -666,7 +666,7 @@ async def write_summary_to_db(
 ):
     logging.info(f"Updating DB with summary for decision number: {decision_number}")
     try:
-        async_case_db_session = sessionmaker(bind=case_db_engine, class_=AsyncSession)
+        async_case_db_session = async_sessionmaker(bind=case_db_engine, class_=AsyncSession)
         async with async_case_db_session() as session:
             try:
                 logging.debug(f"Querying case with decision number: {decision_number}")
