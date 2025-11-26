@@ -124,13 +124,13 @@ Interactive docs: `http://localhost:8004/docs`
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health check (NATS & DB status) |
-| `POST` | `/extractions` | Run extraction synchronously |
-| `POST` | `/extractions/async` | Run extraction in background |
-| `POST` | `/extractions/queue` | Submit to NATS queue |
+| `POST` | `/extractions` | Submit extraction job to NATS queue |
 | `GET` | `/extractions` | List all extractions |
 | `GET` | `/extractions/{id}` | Get extraction result |
 | `GET` | `/extractions/{id}/status` | Get extraction status |
 | `DELETE` | `/extractions/{id}` | Delete extraction |
+| `POST` | `/extractions/batch` | Submit all pending extractions to queue |
+| `GET` | `/extractions/pending/count` | Get count of pending extractions |
 
 ### Health Check
 

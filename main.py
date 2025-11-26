@@ -14,6 +14,7 @@ from fastapi.exceptions import HTTPException
 from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -520,11 +521,11 @@ async def list_extractions(
         records = result.scalars().all()
 
         # Get total count
-        count_query = select(LLMExtraction)
+        count_query = select(func.count()).select_from(LLMExtraction)
         if status:
             count_query = count_query.where(LLMExtraction.status == status)
         count_result = await session.execute(count_query)
-        total = len(count_result.scalars().all())
+        total = count_result.scalar_one()
 
     items = [
         ExtractionResponse(
@@ -586,39 +587,32 @@ async def get_pending_extraction_ids(
     """
     Get extraction IDs that don't have LLM extraction results yet.
 
-    Uses a subquery to find extractions without corresponding llm_extractions records.
+    Uses a NOT IN subquery to find extractions without corresponding
+    llm_extractions records (with COMPLETED or PROCESSING status).
     Only includes extractions where raw_page_link starts with 'https://putusan3'.
     """
     async_session = async_sessionmaker(bind=crawler_db_engine, class_=AsyncSession)
 
     async with async_session() as session:
-        # Get all extraction IDs that don't have llm_extractions or have failed status
-        existing_llm_query = select(LLMExtraction.extraction_id).where(
+        # Subquery for existing LLM extractions with COMPLETED or PROCESSING status
+        existing_subquery = select(LLMExtraction.extraction_id).where(
             LLMExtraction.status.in_([
                 ExtractionStatus.COMPLETED.value,
                 ExtractionStatus.PROCESSING.value,
             ])
         )
-        existing_result = await session.execute(existing_llm_query)
-        existing_ids = {row[0] for row in existing_result.fetchall()}
 
-        # Get all extraction IDs from extractions table
-        # Only include extractions where raw_page_link starts with 'https://putusan3'
-        extraction_query = select(Extraction.id).where(
-            Extraction.raw_page_link.startswith("https://putusan3")
+        # Main query: get extractions not in the existing subquery
+        query = select(Extraction.id).where(
+            Extraction.raw_page_link.startswith("https://putusan3"),
+            Extraction.id.not_in(existing_subquery),
         )
-        if limit:
-            extraction_query = extraction_query.limit(limit)
-
-        extraction_result = await session.execute(extraction_query)
-        all_ids = [row[0] for row in extraction_result.fetchall()]
-
-        # Filter out existing ones
-        pending_ids = [eid for eid in all_ids if eid not in existing_ids]
 
         if limit:
-            return pending_ids[:limit]
-        return pending_ids
+            query = query.limit(limit)
+
+        result = await session.execute(query)
+        return [row[0] for row in result.fetchall()]
 
 
 @app.post(
