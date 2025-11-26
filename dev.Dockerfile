@@ -37,8 +37,8 @@ RUN chmod u+x entrypoint.sh
 # Install all dependencies
 RUN uv sync
 
-ARG SERVICE_PORT=8004
-ENV SERVICE_PORT=${SERVICE_PORT}
-EXPOSE ${SERVICE_PORT}
+ARG PORT=8004
+ENV PORT=${PORT}
+EXPOSE ${PORT}
 
 ENTRYPOINT ["./entrypoint.sh"]

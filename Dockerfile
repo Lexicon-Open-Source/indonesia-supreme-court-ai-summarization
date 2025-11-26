@@ -42,12 +42,12 @@ RUN chmod u+x entrypoint.sh
 RUN uv sync --frozen
 
 # Expose port
-ARG SERVICE_PORT=8004
-ENV SERVICE_PORT=${SERVICE_PORT}
-EXPOSE ${SERVICE_PORT}
+ARG PORT=8004
+ENV PORT=${PORT}
+EXPOSE ${PORT}
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${SERVICE_PORT}/health || exit 1
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 ENTRYPOINT ["./entrypoint.sh"]
