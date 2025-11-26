@@ -1,0 +1,65 @@
+version: "3.8"
+
+services:
+  extraction-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE_PORT: ${SERVICE_PORT:-8004}
+    container_name: court-extraction-api
+    ports:
+      - "${SERVICE_PORT:-8004}:${SERVICE_PORT:-8004}"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - CRAWLER_DB_ADDR=${CRAWLER_DB_ADDR}
+      - CRAWLER_DB_USER=${CRAWLER_DB_USER}
+      - CRAWLER_DB_PASS=${CRAWLER_DB_PASS}
+      - CRAWLER_DB_SCHEMA=${CRAWLER_DB_SCHEMA:-bo_crawler_v1}
+      - CASE_DB_ADDR=${CASE_DB_ADDR}
+      - CASE_DB_USER=${CASE_DB_USER}
+      - CASE_DB_PASS=${CASE_DB_PASS}
+      - CASE_DB_SCHEMA=${CASE_DB_SCHEMA:-bo_v1}
+      - NATS__URL=${NATS__URL:-nats://nats:4222}
+      - NATS__NUM_OF_SUMMARIZER_CONSUMER_INSTANCES=${NATS__NUM_OF_SUMMARIZER_CONSUMER_INSTANCES:-3}
+      - SERVICE_PORT=${SERVICE_PORT:-8004}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID:-}
+      - GCP_CREDENTIALS_BASE64=${GCP_CREDENTIALS_BASE64:-}
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - extraction-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${SERVICE_PORT:-8004}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: nats-server
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["--jetstream", "--store_dir", "/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+    networks:
+      - extraction-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  extraction-network:
+    driver: bridge
+
+volumes:
+  nats-data:

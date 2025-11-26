@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from settings import get_settings
 
-MODEL = "gpt-4o-mini-2024-07-18"
+MODEL = "gemini/gemini-2.5-flash-lite"
 
 SUMMARIZATION_SYSTEM_PROMPT = """
 You are a professional legal expert which can deeply understand the contents and
@@ -173,7 +173,7 @@ async def generate_summary(
             model=MODEL,
             messages=messages,
             response_format=CourtDecisionSummary,
-            api_key=get_settings().openai_api_key,
+            api_key=get_settings().gemini_api_key,
         )
 
         return CourtDecisionSummary(**json.loads(response.choices[0].message.content))
@@ -203,7 +203,7 @@ async def generate_translation(content: str) -> str:
         response = await acompletion(
             model=MODEL,
             messages=messages,
-            api_key=get_settings().openai_api_key,
+            api_key=get_settings().gemini_api_key,
         )
 
         logging.debug("Successfully generated translation")

@@ -1,25 +1,25 @@
 import asyncio
 import json
 import logging
+import os
 import sys
-import time
-from collections.abc import AsyncGenerator
 from collections import deque
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Annotated, Dict
 from statistics import mean, median
+from typing import Annotated
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Query
 from fastapi.exceptions import HTTPException
 from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
-from pydantic import BaseModel
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-)
+from pydantic import BaseModel, Field
+from sqlalchemy import func
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlmodel import select
+from sqlmodel.ext.asyncio.session import AsyncSession
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from contexts import AppContexts
 from nats_consumer import (
@@ -30,390 +30,709 @@ from nats_consumer import (
     close_nats_connection,
     create_job_consumer_async_task,
 )
-from settings import get_settings
-from src.io import write_summary_to_db
-from src.summarization import extract_and_reformat_summary, sanitize_markdown_symbol
+from settings import _temp_credentials_file, get_settings
+from src.extraction import ExtractionStatus, LLMExtraction
+from src.io import Extraction
+from src.pipeline import run_extraction_pipeline
 
-# Add direct print statements for Docker logs - these will be visible regardless of logger configuration
+# Add direct print statements for Docker logs
 print("DIRECT LOG: Starting application initialization", flush=True)
 print(f"DIRECT LOG: Python version: {sys.version}", flush=True)
 
-# Configure logging - CHANGED TO INFO from DEBUG
+# Configure logging
 logging.basicConfig(
-    level=logging.INFO,  # Changed from DEBUG to INFO
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-# Force stream handler to flush after each write
 for handler in logging.root.handlers:
     if isinstance(handler, logging.StreamHandler):
         handler.flush = sys.stdout.flush
 
-logger = logging.getLogger("summarization-api")
-print(f"DIRECT LOG: Created logger: summarization-api at level {logging.getLevelName(logger.level)}", flush=True)
+logger = logging.getLogger("extraction-api")
 
-# Set SQLAlchemy logging level to WARNING to avoid verbose SQL logs
+# Set SQLAlchemy logging level to WARNING
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
-# Quiet down httpx logs which can be verbose
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-class SummarizationRequest(BaseModel):
-    extraction_id: str
+# =============================================================================
+# Request/Response Models
+# =============================================================================
 
+
+class ExtractionRequest(BaseModel):
+    extraction_id: str = Field(..., description="ID of the extraction to process")
+
+
+class ExtractionResponse(BaseModel):
+    id: str
+    extraction_id: str
+    status: str
+    extraction_result: dict | None = None
+    summary_en: str | None = None
+    summary_id: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class ExtractionListResponse(BaseModel):
+    total: int
+    items: list[ExtractionResponse]
+
+
+class ExtractionStatusResponse(BaseModel):
+    extraction_id: str
+    status: str
+    message: str
+
+
+class JobSubmitResponse(BaseModel):
+    message: str
+    extraction_id: str
+    estimated_processing_time_seconds: float
+
+
+class HealthResponse(BaseModel):
+    status: str
+    nats_connected: bool
+    database_connected: bool
+
+
+class BatchExtractionRequest(BaseModel):
+    concurrency: int = Field(
+        default=5, ge=1, le=20, description="Number of concurrent extractions"
+    )
+    limit: int | None = Field(
+        default=None, ge=1, description="Maximum number of extractions to process"
+    )
+
+
+class BatchExtractionResponse(BaseModel):
+    message: str
+    total_pending: int
+    processing: int
+    estimated_time_seconds: float
+
+
+# =============================================================================
+# App Context & Processing Times
+# =============================================================================
 
 CONTEXTS = AppContexts()
 
-# Store recent processing times to calculate estimates (in seconds)
-# Using a deque with maxlen to automatically drop old values
+
+async def get_db_only_contexts() -> AppContexts:
+    """Get app contexts with database only (no NATS initialization)."""
+    return await CONTEXTS.get_app_contexts(init_nats=False)
+
+
+async def get_full_contexts() -> AppContexts:
+    """Get app contexts with NATS initialization."""
+    return await CONTEXTS.get_app_contexts(init_nats=True)
+
+
 PROCESSING_TIMES = {
-    "total": deque(maxlen=100),  # Store last 100 total processing times
-    "extraction": deque(maxlen=100),  # Store last 100 extraction times
-    "db_write": deque(maxlen=100),  # Store last 100 DB write times
+    "total": deque(maxlen=100),
+    "extraction": deque(maxlen=100),
 }
 
-def get_time_estimate() -> Dict[str, float]:
-    """
-    Calculate time estimates based on historical processing times.
-    Returns a dictionary with estimated durations for each processing stage.
-    """
-    estimates = {}
 
-    # If we have enough data, use median (more robust to outliers)
-    # Otherwise fall back to mean or default values
+def get_time_estimate() -> dict[str, float]:
+    estimates = {}
     if len(PROCESSING_TIMES["total"]) >= 5:
         estimates["total"] = median(PROCESSING_TIMES["total"])
     elif len(PROCESSING_TIMES["total"]) > 0:
         estimates["total"] = mean(PROCESSING_TIMES["total"])
     else:
-        estimates["total"] = 60.0  # Default estimate of 60 seconds
+        estimates["total"] = 120.0  # Default estimate
 
     if len(PROCESSING_TIMES["extraction"]) >= 5:
         estimates["extraction"] = median(PROCESSING_TIMES["extraction"])
     elif len(PROCESSING_TIMES["extraction"]) > 0:
         estimates["extraction"] = mean(PROCESSING_TIMES["extraction"])
     else:
-        estimates["extraction"] = 45.0  # Default estimate
-
-    if len(PROCESSING_TIMES["db_write"]) >= 5:
-        estimates["db_write"] = median(PROCESSING_TIMES["db_write"])
-    elif len(PROCESSING_TIMES["db_write"]) > 0:
-        estimates["db_write"] = mean(PROCESSING_TIMES["db_write"])
-    else:
-        estimates["db_write"] = 5.0  # Default estimate
-
+        estimates["extraction"] = 100.0
     return estimates
 
+
 def update_processing_times(stage: str, duration: float) -> None:
-    """
-    Update the historical processing times for a specific stage.
-    """
     if stage in PROCESSING_TIMES:
         PROCESSING_TIMES[stage].append(duration)
-        logger.debug(f"Updated {stage} time statistics: count={len(PROCESSING_TIMES[stage])}, latest={duration:.2f}s")
+        logger.debug(f"Updated {stage} time: {duration:.2f}s")
+
+
+# =============================================================================
+# Lifespan (Startup/Shutdown)
+# =============================================================================
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     global CONTEXTS
-    # startup event
-    print("DIRECT LOG: Starting up summarization API", flush=True)
-    logger.info("Starting up summarization API")
+    print("DIRECT LOG: Starting up extraction API", flush=True)
+    logger.info("Starting up extraction API")
     nats_consumer_job_connection = []
-    try:
-        print(f"DIRECT LOG: About to get app contexts with NATS URL: {get_settings().nats__url}", flush=True)
-        logger.debug("About to get app contexts...")
-        contexts = await CONTEXTS.get_app_contexts()
-        print("DIRECT LOG: Got app contexts", flush=True)
-        logger.debug(f"NATS URL from settings: {get_settings().nats__url}")
 
-        # Ensure stream exists before creating consumers
+    try:
+        contexts = await CONTEXTS.get_app_contexts()
+
+        # Ensure NATS stream exists
         try:
-            print(f"DIRECT LOG: Ensuring stream {STREAM_NAME} exists", flush=True)
-            logger.info(f"Ensuring stream {STREAM_NAME} exists")
             js = contexts.nats_client.jetstream()
             await js.add_stream(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
-            print(f"DIRECT LOG: Stream {STREAM_NAME} confirmed", flush=True)
             logger.info(f"Stream {STREAM_NAME} confirmed")
         except Exception as e:
             if "already exists" not in str(e):
-                print(f"DIRECT LOG: Stream creation warning: {e}", flush=True)
                 logger.warning(f"Stream creation warning: {e}")
-            else:
-                print(f"DIRECT LOG: Stream {STREAM_NAME} already exists", flush=True)
-                logger.info(f"Stream {STREAM_NAME} already exists")
 
-        # Add explicit check for NATS connection
-        if not contexts.nats_client.is_connected:
-            print("DIRECT LOG: NATS client is not connected!", flush=True)
-            logger.error("NATS client is not connected!")
-        else:
-            print("DIRECT LOG: NATS client is connected", flush=True)
-            logger.debug("NATS client is connected")
+        # Create NATS consumer tasks
+        num_consumers = get_settings().nats__num_of_summarizer_consumer_instances
+        logger.info(f"Creating {num_consumers} NATS consumer instances")
 
-        num_of_summarizer_consumer_instances = (
-            get_settings().nats__num_of_summarizer_consumer_instances
+        consumer_tasks = create_job_consumer_async_task(
+            nats_client=contexts.nats_client,
+            jetstream_client=contexts.jetstream_client,
+            consumer_config=CONSUMER_CONFIG,
+            processing_func=process_nats_message,
+            num_of_consumer_instances=num_consumers,
         )
-        print(f"DIRECT LOG: Creating {num_of_summarizer_consumer_instances} NATS consumer instances", flush=True)
-        logger.info(f"Creating {num_of_summarizer_consumer_instances} NATS consumer instances (pull-based)")
+        nats_consumer_job_connection.extend(consumer_tasks)
+        logger.info("Startup completed successfully")
 
-        # More detailed logging for task creation
-        try:
-            print("DIRECT LOG: Creating consumer tasks", flush=True)
-            consumer_tasks = create_job_consumer_async_task(
-                nats_client=contexts.nats_client,
-                jetstream_client=contexts.jetstream_client,
-                consumer_config=CONSUMER_CONFIG,
-                processing_func=generate_summary,
-                num_of_consumer_instances=num_of_summarizer_consumer_instances,
-            )
-            print(f"DIRECT LOG: Created {len(consumer_tasks)} consumer tasks", flush=True)
-            logger.debug(f"Created {len(consumer_tasks)} consumer tasks")
-            nats_consumer_job_connection.extend(consumer_tasks)
-
-            # Add task status check
-            for i, task in enumerate(consumer_tasks):
-                print(f"DIRECT LOG: Consumer task {i+1} status: done={task.done()}, cancelled={task.cancelled()}", flush=True)
-                logger.debug(f"Consumer task {i+1} status: done={task.done()}, cancelled={task.cancelled()}")
-
-        except Exception as consumer_ex:
-            print(f"DIRECT LOG: Error creating consumer tasks: {str(consumer_ex)}", flush=True)
-            logger.error(f"Error creating consumer tasks: {str(consumer_ex)}")
-
-        print("DIRECT LOG: Startup completed successfully", flush=True)
-        logger.info("Startup completed successfully - consumers are ready for immediate message processing")
     except Exception as e:
-        print(f"DIRECT LOG: Error during startup: {str(e)}", flush=True)
-        logger.error(f"Error during startup: {str(e)}")
+        logger.error(f"Error during startup: {e}")
         raise
+
     yield
 
-    # shutdown event
-    print("DIRECT LOG: Shutting down summarization API", flush=True)
-    logger.info("Shutting down summarization API")
+    # Shutdown
+    logger.info("Shutting down extraction API")
     for task in nats_consumer_job_connection:
         try:
-            print(f"DIRECT LOG: Closing NATS connection for task: {task}", flush=True)
-            logger.debug(f"Closing NATS connection for task: {task}")
-            close_task = asyncio.create_task(close_nats_connection(task))
-            await close_task
+            await close_nats_connection(task)
         except Exception as e:
-            print(f"DIRECT LOG: Error closing NATS connection: {str(e)}", flush=True)
-            logger.error(f"Error closing NATS connection: {str(e)}")
-    print("DIRECT LOG: Shutdown completed", flush=True)
+            logger.error(f"Error closing NATS connection: {e}")
+
+    # Clean up temporary GCP credentials file
+    if _temp_credentials_file and os.path.exists(_temp_credentials_file):
+        try:
+            os.unlink(_temp_credentials_file)
+            logger.debug(f"Cleaned up temporary credentials file: {_temp_credentials_file}")
+        except Exception as e:
+            logger.warning(f"Failed to remove temporary credentials file: {e}")
+
     logger.info("Shutdown completed")
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Court Decision Extraction API",
+    description="API for extracting structured data from Indonesian Supreme Court decisions",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 
-async def generate_summary(msg: Msg) -> None:
+# =============================================================================
+# NATS Message Processor
+# =============================================================================
+
+
+async def process_nats_message(msg: Msg) -> None:
+    """Process extraction request from NATS queue."""
     global CONTEXTS
-    print("DIRECT LOG: Starting generate_summary for NATS message", flush=True)
-    logger.info("Starting generate_summary for NATS message")
-
-    # Start timing the entire process
+    logger.info("Processing NATS message")
     total_start_time = asyncio.get_event_loop().time()
     extraction_id = None
 
     try:
-        # Timing: Context initialization
-        context_start_time = asyncio.get_event_loop().time()
         contexts = await CONTEXTS.get_app_contexts(init_nats=True)
-        context_end_time = asyncio.get_event_loop().time()
-        context_duration = context_end_time - context_start_time
-        logger.info(f"AppContexts initialization took {context_duration:.2f} seconds")
-
-        # Timing: Message decoding
-        decode_start_time = asyncio.get_event_loop().time()
         data = json.loads(msg.data.decode())
-        decode_end_time = asyncio.get_event_loop().time()
-        decode_duration = decode_end_time - decode_start_time
-        logger.debug(f"Message decoding took {decode_duration:.2f} seconds")
-
-        print(f"DIRECT LOG: Processing summarization request: {data}", flush=True)
-        logger.info(f"Processing summarization request: {data}")
-
         extraction_id = data.get("extraction_id")
+
         if not extraction_id:
-            print(f"DIRECT LOG: Missing extraction_id in request data: {data}", flush=True)
-            logger.error(f"Missing extraction_id in request data: {data}")
-            # Acknowledge invalid messages to prevent reprocessing
+            logger.error(f"Missing extraction_id in message: {data}")
             await msg.ack()
             return
 
-        try:
-            print(f"DIRECT LOG: Extracting and reformatting summary for extraction_id: {extraction_id}", flush=True)
-            logger.info(f"Extracting and reformatting summary for extraction_id: {extraction_id}")
+        logger.info(f"Processing extraction: {extraction_id}")
 
-            # Timing: Summary extraction
-            extract_start_time = asyncio.get_event_loop().time()
-            (
-                summary,
-                translated_summary,
-                decision_number,
-            ) = await extract_and_reformat_summary(
+        # Check if extraction is already completed (idempotency check)
+        async_session = async_sessionmaker(
+            bind=contexts.crawler_db_engine, class_=AsyncSession
+        )
+        async with async_session() as session:
+            result = await session.execute(
+                select(LLMExtraction).where(
+                    LLMExtraction.extraction_id == extraction_id
+                )
+            )
+            existing = result.scalar_one_or_none()
+            if existing and existing.status == ExtractionStatus.COMPLETED.value:
+                logger.info(
+                    f"Extraction {extraction_id} already completed, skipping"
+                )
+                await msg.ack()
+                return
+
+        extract_start = asyncio.get_event_loop().time()
+        extraction_result, summary_id, summary_en, decision_number = (
+            await run_extraction_pipeline(
                 extraction_id=extraction_id,
                 crawler_db_engine=contexts.crawler_db_engine,
                 case_db_engine=contexts.case_db_engine,
             )
-            extract_end_time = asyncio.get_event_loop().time()
-            extract_duration = extract_end_time - extract_start_time
-            logger.info(f"Summary extraction for {extraction_id} took {extract_duration:.2f} seconds")
-            # Store extraction time for future estimates
-            update_processing_times("extraction", extract_duration)
+        )
+        extract_duration = asyncio.get_event_loop().time() - extract_start
+        update_processing_times("extraction", extract_duration)
 
-            print(f"DIRECT LOG: Sanitizing summary data for decision number: {decision_number}", flush=True)
-            logger.info(f"Sanitizing summary data for decision number: {decision_number}")
+        logger.info(f"Completed extraction for {decision_number}")
+        logger.info(f"Extracted {len(extraction_result.model_dump(exclude_none=True))} fields")
+        await msg.ack()
 
-            # Timing: Sanitization
-            sanitize_start_time = asyncio.get_event_loop().time()
-            summary_text = sanitize_markdown_symbol(summary)
-            translated_summary_text = sanitize_markdown_symbol(translated_summary)
-            sanitize_end_time = asyncio.get_event_loop().time()
-            sanitize_duration = sanitize_end_time - sanitize_start_time
-            logger.debug(f"Summary sanitization took {sanitize_duration:.2f} seconds")
-
-            print(f"DIRECT LOG: Updating database with summary for decision number: {decision_number}", flush=True)
-            logger.info(f"Updating database with summary for decision number: {decision_number}")
-
-            # Timing: Database write
-            db_write_start_time = asyncio.get_event_loop().time()
-            await write_summary_to_db(
-                case_db_engine=contexts.case_db_engine,
-                decision_number=decision_number,
-                summary=summary,
-                summary_text=summary_text,
-                translated_summary=translated_summary,
-                translated_summary_text=translated_summary_text,
-            )
-            db_write_end_time = asyncio.get_event_loop().time()
-            db_write_duration = db_write_end_time - db_write_start_time
-            logger.info(f"Database write for decision {decision_number} took {db_write_duration:.2f} seconds")
-            # Store DB write time for future estimates
-            update_processing_times("db_write", db_write_duration)
-
-            print(f"DIRECT LOG: Successfully processed summarization for decision number: {decision_number}", flush=True)
-            logger.info(f"Successfully processed summarization for decision number: {decision_number}")
-            # Acknowledge successful processing
-            await msg.ack()
-        except Exception as e:
-            print(f"DIRECT LOG: Failed to process summarization for {extraction_id}: {str(e)}", flush=True)
-            logger.error(f"Failed to process summarization for {extraction_id}: {str(e)}")
-            # For processing errors, we should not ack (let NATS retry delivery)
-            # But if we're using max_deliver=2 in config, we should ack to prevent infinite retries
-            await msg.ack()
     except json.JSONDecodeError as e:
-        print(f"DIRECT LOG: Invalid JSON in message: {e}", flush=True)
         logger.error(f"Invalid JSON in message: {e}")
-        # Acknowledge invalid messages to prevent reprocessing
         await msg.ack()
     except Exception as e:
-        print(f"DIRECT LOG: Critical error in generate_summary: {str(e)}", flush=True)
-        logger.error(f"Critical error in generate_summary: {str(e)}")
-        # Log the message content in case of critical failures
-        try:
-            print(f"DIRECT LOG: Message content: {msg.data.decode()}", flush=True)
-            logger.error(f"Message content: {msg.data.decode()}")
-        except:
-            print("DIRECT LOG: Could not decode message data", flush=True)
-            logger.error("Could not decode message data")
-        # For critical errors, we should not ack (let NATS retry delivery)
-        await msg.ack()  # Still ack to avoid stuck messages
+        logger.error(f"Failed to process extraction {extraction_id}: {e}")
+        await msg.ack()
     finally:
-        # Calculate and log total processing time
-        total_end_time = asyncio.get_event_loop().time()
-        total_duration = total_end_time - total_start_time
-        logger.info(f"Total processing time for message {extraction_id or 'unknown'}: {total_duration:.2f} seconds")
-        # Store total time for future estimates
-        if extraction_id:  # Only store successful runs
+        total_duration = asyncio.get_event_loop().time() - total_start_time
+        logger.info(f"Total processing time: {total_duration:.2f}s")
+        if extraction_id:
             update_processing_times("total", total_duration)
-        sys.stdout.flush()
+
+
+# =============================================================================
+# API Endpoints
+# =============================================================================
+
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health_check(
+    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+) -> HealthResponse:
+    """Check API health status."""
+    nats_connected = (
+        app_contexts.nats_client is not None
+        and app_contexts.nats_client.is_connected
+    )
+
+    # Check database connection
+    db_connected = False
+    try:
+        async_session = async_sessionmaker(
+            bind=app_contexts.crawler_db_engine, class_=AsyncSession
+        )
+        async with async_session() as session:
+            await session.execute(select(1))
+            db_connected = True
+    except Exception:
+        pass
+
+    return HealthResponse(
+        status="healthy" if (nats_connected and db_connected) else "degraded",
+        nats_connected=nats_connected,
+        database_connected=db_connected,
+    )
 
 
 @app.post(
-    "/court-decision/summarize",
-    summary="Route for submitting summarization job",
+    "/extractions",
+    response_model=JobSubmitResponse,
+    tags=["Extractions"],
+    summary="Submit extraction job",
 )
 @retry(
     wait=wait_exponential(multiplier=1, min=2, max=10),
     stop=stop_after_attempt(5),
     reraise=True,
 )
-async def submit_summarization_job(
-    payload: SummarizationRequest,
-    app_contexts: Annotated[AppContexts, Depends(CONTEXTS.get_app_contexts)],
-) -> dict:
-    logger.info(f"Received summarization job request: {payload}")
-    try:
-        extraction_id = payload.extraction_id
-        if not extraction_id:
-            logger.error("Missing extraction_id in request payload")
-            raise HTTPException(
-                status_code=HTTPStatus.BAD_REQUEST,
-                detail="extraction_id is required"
-            )
+async def submit_extraction(
+    payload: ExtractionRequest,
+    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+) -> JobSubmitResponse:
+    """
+    Submit extraction job to NATS queue for processing.
 
+    Returns immediately with job info. Check status via GET /extractions/{id}/status.
+    """
+    logger.info(f"Submitting async extraction: {payload.extraction_id}")
+
+    # Create PENDING entry in database immediately
+    async_session = async_sessionmaker(
+        bind=app_contexts.crawler_db_engine, class_=AsyncSession
+    )
+    async with async_session() as session:
+        # Check if already exists
+        result = await session.execute(
+            select(LLMExtraction).where(
+                LLMExtraction.extraction_id == payload.extraction_id
+            )
+        )
+        existing = result.scalar_one_or_none()
+
+        if not existing:
+            # Create new PENDING record
+            llm_extraction = LLMExtraction(
+                extraction_id=payload.extraction_id,
+                status=ExtractionStatus.PENDING.value,
+            )
+            session.add(llm_extraction)
+            await session.commit()
+            logger.info(f"Created PENDING record for: {payload.extraction_id}")
+        else:
+            # Reset status to PENDING for re-processing
+            existing.status = ExtractionStatus.PENDING.value
+            session.add(existing)
+            await session.commit()
+            logger.info(f"Reset status to PENDING for: {payload.extraction_id}")
+
+    try:
         nats_client: NATS = app_contexts.nats_client
         if not nats_client.is_connected:
-            logger.warning("NATS client is not connected, reconnecting...")
-            # Likely a reconnection will happen in get_app_contexts with init_nats=True
             app_contexts = await CONTEXTS.get_app_contexts(init_nats=True)
             nats_client = app_contexts.nats_client
 
         js = nats_client.jetstream()
 
-        logger.debug(f"Adding stream {STREAM_NAME} with subjects {STREAM_SUBJECTS}")
         try:
-            await js.add_stream(
-                name=STREAM_NAME,
-                subjects=[STREAM_SUBJECTS],
-            )
+            await js.add_stream(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
         except Exception as e:
             if "already exists" not in str(e):
                 logger.warning(f"Stream creation warning: {e}")
-            else:
-                logger.debug(f"Stream {STREAM_NAME} already exists")
 
-        # Convert to JSON and check the message before publishing
         json_payload = payload.model_dump_json()
-        logger.debug(f"Message to publish: {json_payload}")
+        await js.publish(SUBJECT, json_payload.encode())
+        logger.info(f"Published to NATS: {payload.extraction_id}")
 
-        logger.info(f"Publishing summarization job for extraction_id: {extraction_id}")
-
-        # Get time estimate before publishing job
-        time_estimates = get_time_estimate()
-        estimated_total_seconds = time_estimates["total"]
-        estimated_minutes = int(estimated_total_seconds // 60)
-        estimated_seconds = int(estimated_total_seconds % 60)
-
-        logger.info(f"Estimated processing time for extraction_id {extraction_id}: {estimated_minutes}m {estimated_seconds}s")
-
-        # Submit the job
-        ack = await js.publish(SUBJECT, json_payload.encode())
-        logger.info(f"Successfully submitted summarization job: {payload}, ack: {ack}")
-
-        # Verify the stream stats after publishing
-        try:
-            stream_info = await js.stream_info(STREAM_NAME)
-            logger.debug(f"Stream stats after publish: messages={stream_info.state.messages}, consumers={len(stream_info.state.consumer_count)}")
-        except Exception as e:
-            logger.warning(f"Could not get stream stats: {e}")
-
-    except Exception as e:
-        err_msg = f"Error processing summarization: {str(e)}; RECEIVED DATA: {payload}"
-        logger.error(err_msg)
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST,
-            detail=f"Failed to process summarization request: {str(e)}"
+        estimates = get_time_estimate()
+        return JobSubmitResponse(
+            message="Extraction job queued",
+            extraction_id=payload.extraction_id,
+            estimated_processing_time_seconds=estimates["total"],
         )
 
-    # Return success response with the time estimate
-    time_estimates = get_time_estimate()
+    except Exception as e:
+        logger.error(f"Failed to queue extraction: {e}")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail=f"Failed to queue extraction: {str(e)}",
+        )
+
+
+@app.get(
+    "/extractions/{extraction_id}",
+    response_model=ExtractionResponse,
+    tags=["Extractions"],
+    summary="Get extraction result",
+)
+async def get_extraction(
+    extraction_id: str,
+    app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+) -> ExtractionResponse:
+    """Get extraction result by extraction_id."""
+    async_session = async_sessionmaker(
+        bind=app_contexts.crawler_db_engine, class_=AsyncSession
+    )
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(LLMExtraction).where(LLMExtraction.extraction_id == extraction_id)
+        )
+        record = result.scalar_one_or_none()
+
+    if not record:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail=f"Extraction not found: {extraction_id}",
+        )
+
+    return ExtractionResponse(
+        id=record.id,
+        extraction_id=record.extraction_id,
+        status=record.status,
+        extraction_result=record.extraction_result,
+        summary_en=record.summary_en,
+        summary_id=record.summary_id,
+        created_at=record.created_at.isoformat(),
+        updated_at=record.updated_at.isoformat(),
+    )
+
+
+@app.get(
+    "/extractions/{extraction_id}/status",
+    response_model=ExtractionStatusResponse,
+    tags=["Extractions"],
+    summary="Get extraction status",
+)
+async def get_extraction_status(
+    extraction_id: str,
+    app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+) -> ExtractionStatusResponse:
+    """Get extraction status by extraction_id."""
+    async_session = async_sessionmaker(
+        bind=app_contexts.crawler_db_engine, class_=AsyncSession
+    )
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(LLMExtraction).where(LLMExtraction.extraction_id == extraction_id)
+        )
+        record = result.scalar_one_or_none()
+
+    if not record:
+        return ExtractionStatusResponse(
+            extraction_id=extraction_id,
+            status="not_found",
+            message="Extraction not started or does not exist",
+        )
+
+    messages = {
+        ExtractionStatus.PENDING.value: "Extraction is pending",
+        ExtractionStatus.PROCESSING.value: "Extraction is in progress",
+        ExtractionStatus.COMPLETED.value: "Extraction completed successfully",
+        ExtractionStatus.FAILED.value: "Extraction failed",
+    }
+
+    return ExtractionStatusResponse(
+        extraction_id=extraction_id,
+        status=record.status,
+        message=messages.get(record.status, "Unknown status"),
+    )
+
+
+@app.get(
+    "/extractions",
+    response_model=ExtractionListResponse,
+    tags=["Extractions"],
+    summary="List extractions",
+)
+async def list_extractions(
+    app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    status: str | None = Query(None, description="Filter by status"),
+    limit: int = Query(20, ge=1, le=100, description="Number of results"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+) -> ExtractionListResponse:
+    """List all extractions with optional filtering."""
+    async_session = async_sessionmaker(
+        bind=app_contexts.crawler_db_engine, class_=AsyncSession
+    )
+
+    async with async_session() as session:
+        # Build query
+        query = select(LLMExtraction)
+        if status:
+            query = query.where(LLMExtraction.status == status)
+        query = query.order_by(LLMExtraction.created_at.desc())
+        query = query.offset(offset).limit(limit)
+
+        result = await session.execute(query)
+        records = result.scalars().all()
+
+        # Get total count
+        count_query = select(func.count()).select_from(LLMExtraction)
+        if status:
+            count_query = count_query.where(LLMExtraction.status == status)
+        count_result = await session.execute(count_query)
+        total = count_result.scalar_one()
+
+    items = [
+        ExtractionResponse(
+            id=r.id,
+            extraction_id=r.extraction_id,
+            status=r.status,
+            extraction_result=r.extraction_result,
+            summary_en=r.summary_en,
+            summary_id=r.summary_id,
+            created_at=r.created_at.isoformat(),
+            updated_at=r.updated_at.isoformat(),
+        )
+        for r in records
+    ]
+
+    return ExtractionListResponse(total=total, items=items)
+
+
+@app.delete(
+    "/extractions/{extraction_id}",
+    tags=["Extractions"],
+    summary="Delete extraction",
+)
+async def delete_extraction(
+    extraction_id: str,
+    app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+) -> dict:
+    """Delete an extraction record."""
+    async_session = async_sessionmaker(
+        bind=app_contexts.crawler_db_engine, class_=AsyncSession
+    )
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(LLMExtraction).where(LLMExtraction.extraction_id == extraction_id)
+        )
+        record = result.scalar_one_or_none()
+
+        if not record:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND,
+                detail=f"Extraction not found: {extraction_id}",
+            )
+
+        await session.delete(record)
+        await session.commit()
+
+    return {"message": f"Extraction {extraction_id} deleted"}
+
+
+# =============================================================================
+# Batch Extraction Endpoints
+# =============================================================================
+
+
+async def get_pending_extraction_ids(
+    crawler_db_engine: AsyncEngine, limit: int | None = None
+) -> list[str]:
+    """
+    Get extraction IDs that don't have LLM extraction results yet.
+
+    Uses a NOT IN subquery to find extractions without corresponding
+    llm_extractions records (with COMPLETED or PROCESSING status).
+    Only includes extractions where raw_page_link starts with 'https://putusan3'.
+    """
+    async_session = async_sessionmaker(bind=crawler_db_engine, class_=AsyncSession)
+
+    async with async_session() as session:
+        # Subquery for existing LLM extractions with COMPLETED or PROCESSING status
+        existing_subquery = select(LLMExtraction.extraction_id).where(
+            LLMExtraction.status.in_([
+                ExtractionStatus.COMPLETED.value,
+                ExtractionStatus.PROCESSING.value,
+            ])
+        )
+
+        # Main query: get extractions not in the existing subquery
+        query = select(Extraction.id).where(
+            Extraction.raw_page_link.startswith("https://putusan3"),
+            Extraction.id.not_in(existing_subquery),
+        )
+
+        if limit:
+            query = query.limit(limit)
+
+        result = await session.execute(query)
+        return [row[0] for row in result.fetchall()]
+
+
+@app.post(
+    "/extractions/batch",
+    response_model=BatchExtractionResponse,
+    tags=["Batch Extractions"],
+    summary="Submit all pending extractions to NATS queue",
+)
+async def submit_batch_extraction_async(
+    payload: BatchExtractionRequest,
+    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+) -> BatchExtractionResponse:
+    """
+    Submit all pending extractions to NATS queue for processing.
+
+    Returns immediately with job info. Use /extractions endpoint to check progress.
+    """
+    logger.info(f"Submitting batch extraction with limit={payload.limit}")
+
+    # Get pending extraction IDs
+    pending_ids = await get_pending_extraction_ids(
+        crawler_db_engine=app_contexts.crawler_db_engine,
+        limit=payload.limit,
+    )
+
+    if not pending_ids:
+        return BatchExtractionResponse(
+            message="No pending extractions found",
+            total_pending=0,
+            processing=0,
+            estimated_time_seconds=0,
+        )
+
+    # Create PENDING records and publish to NATS
+    async_session = async_sessionmaker(
+        bind=app_contexts.crawler_db_engine, class_=AsyncSession
+    )
+
+    nats_client: NATS = app_contexts.nats_client
+    if not nats_client.is_connected:
+        app_contexts = await CONTEXTS.get_app_contexts(init_nats=True)
+        nats_client = app_contexts.nats_client
+
+    js = nats_client.jetstream()
+
+    try:
+        await js.add_stream(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
+    except Exception as e:
+        if "already exists" not in str(e):
+            logger.warning(f"Stream creation warning: {e}")
+
+    published_count = 0
+    for extraction_id in pending_ids:
+        try:
+            # Create or update PENDING record
+            async with async_session() as session:
+                result = await session.execute(
+                    select(LLMExtraction).where(
+                        LLMExtraction.extraction_id == extraction_id
+                    )
+                )
+                existing = result.scalar_one_or_none()
+
+                if not existing:
+                    llm_extraction = LLMExtraction(
+                        extraction_id=extraction_id,
+                        status=ExtractionStatus.PENDING.value,
+                    )
+                    session.add(llm_extraction)
+                    await session.commit()
+                else:
+                    # Reset status to PENDING for re-processing
+                    existing.status = ExtractionStatus.PENDING.value
+                    session.add(existing)
+                    await session.commit()
+
+            # Publish to NATS
+            json_payload = ExtractionRequest(extraction_id=extraction_id).model_dump_json()
+            await js.publish(SUBJECT, json_payload.encode())
+            published_count += 1
+
+        except Exception as e:
+            logger.error(f"Failed to queue {extraction_id}: {e}")
+
+    logger.info(f"Published {published_count}/{len(pending_ids)} extractions to NATS")
+
+    estimates = get_time_estimate()
+    estimated_time = len(pending_ids) * estimates["total"]
+
+    return BatchExtractionResponse(
+        message=f"Batch extraction queued: {published_count} jobs",
+        total_pending=len(pending_ids),
+        processing=published_count,
+        estimated_time_seconds=estimated_time,
+    )
+
+
+@app.get(
+    "/extractions/pending/count",
+    tags=["Batch Extractions"],
+    summary="Get count of pending extractions",
+)
+async def get_pending_count(
+    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+) -> dict:
+    """Get the number of extractions pending LLM processing."""
+    pending_ids = await get_pending_extraction_ids(
+        crawler_db_engine=app_contexts.crawler_db_engine,
+    )
     return {
-        "data": "success",
-        "estimated_processing_time_seconds": time_estimates["total"],
-        "estimated_completion_time": time.time() + time_estimates["total"]
+        "pending_count": len(pending_ids),
+        "message": f"{len(pending_ids)} extractions pending LLM processing",
     }
