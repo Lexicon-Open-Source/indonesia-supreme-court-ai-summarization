@@ -77,8 +77,8 @@ async def extract(extraction_id: str):
         print("\n" + "=" * 60)
 
     except Exception as e:
-        logger.error(f"Error processing extraction for {extraction_id}: {e}")
-        raise typer.Exit(code=1)
+        logger.exception(f"Error processing extraction for {extraction_id}: {e}")
+        raise typer.Exit(code=1) from e
 
 
 if __name__ == "__main__":

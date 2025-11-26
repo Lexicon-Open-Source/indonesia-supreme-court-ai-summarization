@@ -5,7 +5,7 @@ ENV PYSETUP_PATH="/opt/pysetup" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-ENV PATH=${UV_INSTALL_DIR}/bin:$PATH
+ENV PATH=${UV_INSTALL_DIR}:$PATH
 
 WORKDIR $PYSETUP_PATH
 
@@ -27,7 +27,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Install UV
-RUN curl -LsSf https://astral.sh/uv/0.4.29/install.sh | sh && \
+RUN curl -LsSf https://astral.sh/uv/0.9.10/install.sh | sh && \
     uv python install 3.10
 
 # Copy application files

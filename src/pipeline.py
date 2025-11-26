@@ -103,7 +103,7 @@ async def run_extraction_pipeline(
         return extraction_result, summary_id, summary_en, decision_number
 
     except Exception as e:
-        logger.error(f"Extraction pipeline failed for {extraction_id}: {e}")
+        logger.exception(f"Extraction pipeline failed for {extraction_id}: {e}")
         # Try to update status to failed
         try:
             await update_llm_extraction_status(

@@ -54,10 +54,17 @@ Edit `.env`:
 # Gemini API Key (from https://aistudio.google.com/apikey)
 GEMINI_API_KEY=your_gemini_api_key
 
-# Database
-DB_ADDR=localhost:5432
-DB_USER=postgres
-DB_PASS=your_password
+# Crawler database (bo_crawler_v1 schema)
+CRAWLER_DB_ADDR=localhost:5432
+CRAWLER_DB_USER=postgres
+CRAWLER_DB_PASS=your_password
+CRAWLER_DB_SCHEMA=bo_crawler_v1
+
+# Case database (bo_v1 schema)
+CASE_DB_ADDR=localhost:5432
+CASE_DB_USER=postgres
+CASE_DB_PASS=your_password
+CASE_DB_SCHEMA=bo_v1
 
 # NATS
 NATS__URL=nats://localhost:4222

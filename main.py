@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 from collections import deque
 from collections.abc import AsyncGenerator
@@ -29,7 +30,7 @@ from nats_consumer import (
     close_nats_connection,
     create_job_consumer_async_task,
 )
-from settings import get_settings
+from settings import _temp_credentials_file, get_settings
 from src.extraction import ExtractionStatus, LLMExtraction
 from src.io import Extraction
 from src.pipeline import run_extraction_pipeline
@@ -212,6 +213,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             await close_nats_connection(task)
         except Exception as e:
             logger.error(f"Error closing NATS connection: {e}")
+
+    # Clean up temporary GCP credentials file
+    if _temp_credentials_file and os.path.exists(_temp_credentials_file):
+        try:
+            os.unlink(_temp_credentials_file)
+            logger.debug(f"Cleaned up temporary credentials file: {_temp_credentials_file}")
+        except Exception as e:
+            logger.warning(f"Failed to remove temporary credentials file: {e}")
+
     logger.info("Shutdown completed")
 
 

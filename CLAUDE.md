@@ -101,10 +101,12 @@ The service connects to PostgreSQL with two schemas:
 
 Required:
 - `GEMINI_API_KEY`: Gemini API key from Google AI Studio
-- `DB_ADDR`: PostgreSQL address (host:port)
-- `DB_USER`, `DB_PASS`: Database credentials
+- `CRAWLER_DB_ADDR`, `CRAWLER_DB_USER`, `CRAWLER_DB_PASS`: Crawler database connection
+- `CASE_DB_ADDR`, `CASE_DB_USER`, `CASE_DB_PASS`: Case database connection
 - `NATS__URL`: NATS server URL
 
 Optional:
+- `CRAWLER_DB_SCHEMA`: Crawler database schema (default: bo_crawler_v1)
+- `CASE_DB_SCHEMA`: Case database schema (default: bo_v1)
 - `NATS__NUM_OF_SUMMARIZER_CONSUMER_INSTANCES`: Number of consumer instances (default: 3)
 - `GCP_PROJECT_ID`, `GCP_CREDENTIALS_BASE64`: For GCS PDF access
