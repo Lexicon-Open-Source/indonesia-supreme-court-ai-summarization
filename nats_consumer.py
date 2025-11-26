@@ -310,10 +310,22 @@ async def run_pull_job_consumer_improved(
                 )
                 # Log queue depth periodically
                 num_pending = consumerInfo.num_pending
+                num_ack_pending = consumerInfo.num_ack_pending
+                max_ack_pending = consumer_config.max_ack_pending
                 logger.info(
                     f"{worker_name} Consumer info: pending={num_pending}, "
+                    f"ack_pending={num_ack_pending}/{max_ack_pending}, "
                     f"stream={stream_name}, consumer={consumer_config.durable_name}"
                 )
+
+                # Warn if consumer is blocked due to max_ack_pending
+                if num_ack_pending >= max_ack_pending and num_pending > 0:
+                    logger.warning(
+                        f"{worker_name} Consumer blocked! {num_ack_pending} messages in-flight "
+                        f"(max={max_ack_pending}). {num_pending} messages waiting. "
+                        f"Messages will be redelivered after ack_wait={consumer_config.ack_wait}s expires, "
+                        f"or use /nats/consumer/reset endpoint to reset."
+                    )
 
             except nats.js.errors.NotFoundError:
                 logger.info(f"{worker_name} Creating shared consumer: {consumer_config.durable_name}")
@@ -323,7 +335,8 @@ async def run_pull_job_consumer_improved(
                 )
                 logger.info(f"{worker_name} Created shared consumer: {consumer_config.durable_name}")
                 num_pending = consumerInfo.num_pending
-                logger.info(f"{worker_name} Initial pending messages: {num_pending}")
+                num_ack_pending = consumerInfo.num_ack_pending
+                logger.info(f"{worker_name} Initial pending={num_pending}, ack_pending={num_ack_pending}")
             except Exception as consumer_error:
                 logger.error(f"{worker_name} Error checking/creating consumer: {consumer_error}")
                 await asyncio.sleep(2)
@@ -332,10 +345,13 @@ async def run_pull_job_consumer_improved(
             # Set up subscription if needed
             if subscription is None:
                 try:
-                    logger.debug(f"{worker_name} Setting up pull subscription...")
-                    subscription = await jetstream_client.pull_subscribe(
-                        subject=consumer_config.filter_subject,
-                        durable=consumer_config.durable_name,
+                    logger.info(
+                        f"{worker_name} Binding to consumer {consumer_config.durable_name} "
+                        f"on stream {stream_name}"
+                    )
+                    subscription = await jetstream_client.pull_subscribe_bind(
+                        consumer=consumer_config.durable_name,
+                        stream=stream_name,
                     )
                     logger.info(f"{worker_name} Pull subscription established")
                 except Exception as sub_error:

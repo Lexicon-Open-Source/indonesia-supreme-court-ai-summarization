@@ -217,6 +217,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             if "already exists" not in str(e):
                 logger.warning(f"Stream creation warning: {e}")
 
+        # Ensure consumer exists with correct configuration
+        try:
+            consumer_info = await js.consumer_info(
+                STREAM_NAME, CONSUMER_CONFIG.durable_name
+            )
+            # Check if consumer has deliver_group (bad config from before)
+            if consumer_info.config.deliver_group:
+                logger.warning(
+                    f"Consumer {CONSUMER_CONFIG.durable_name} has deliver_group set, "
+                    "recreating..."
+                )
+                await js.delete_consumer(STREAM_NAME, CONSUMER_CONFIG.durable_name)
+                await js.add_consumer(stream=STREAM_NAME, config=CONSUMER_CONFIG)
+                logger.info(f"Recreated consumer {CONSUMER_CONFIG.durable_name}")
+            else:
+                logger.info(
+                    f"Consumer {CONSUMER_CONFIG.durable_name} exists with correct config"
+                )
+        except Exception as e:
+            # Consumer doesn't exist, create it
+            if "not found" in str(e).lower():
+                await js.add_consumer(stream=STREAM_NAME, config=CONSUMER_CONFIG)
+                logger.info(f"Created consumer {CONSUMER_CONFIG.durable_name}")
+            else:
+                logger.warning(f"Consumer check warning: {e}")
+
         # Create NATS consumer tasks
         num_consumers = get_settings().nats__num_of_summarizer_consumer_instances
         logger.info(f"Creating {num_consumers} NATS consumer instances")
@@ -288,10 +314,37 @@ async def process_nats_message(msg: Msg) -> None:
 
         logger.info(f"Processing extraction: {extraction_id}")
 
-        # Check if extraction is already completed (idempotency check)
         async_session = async_sessionmaker(
             bind=contexts.crawler_db_engine, class_=AsyncSession
         )
+
+        # Check if extraction meets criteria (has artifact_link and valid raw_page_link)
+        async with async_session() as session:
+            result = await session.execute(
+                select(Extraction).where(Extraction.id == extraction_id)
+            )
+            extraction_record = result.scalar_one_or_none()
+
+            if not extraction_record:
+                logger.warning(f"Extraction {extraction_id} not found, skipping")
+                await msg.ack()
+                return
+
+            if not extraction_record.artifact_link:
+                logger.warning(
+                    f"Extraction {extraction_id} has no artifact_link, skipping"
+                )
+                await msg.ack()
+                return
+
+            if not extraction_record.raw_page_link.startswith("https://putusan3"):
+                logger.warning(
+                    f"Extraction {extraction_id} has invalid raw_page_link, skipping"
+                )
+                await msg.ack()
+                return
+
+        # Check if extraction is already completed (idempotency check)
         async with async_session() as session:
             result = await session.execute(
                 select(LLMExtraction).where(
@@ -895,3 +948,71 @@ async def get_nats_diagnostics(
             "publish_subject": SUBJECT,
         },
     }
+
+
+@app.post(
+    "/nats/consumer/reset",
+    tags=["Diagnostics"],
+    summary="Reset stuck consumer by deleting and recreating it",
+)
+async def reset_nats_consumer(
+    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict:
+    """
+    Reset the NATS consumer by deleting and recreating it.
+
+    Use this when messages are stuck in "ack_pending" state from crashed consumers.
+    This will cause all in-flight messages to be redelivered immediately.
+
+    WARNING: This will reset consumer state. Any messages currently being processed
+    may be delivered again (at-least-once delivery).
+    """
+    js = app_contexts.nats_client.jetstream()
+
+    try:
+        # Get current consumer state for logging
+        try:
+            consumer_info = await js.consumer_info(
+                STREAM_NAME, CONSUMER_CONFIG.durable_name
+            )
+            old_state = {
+                "num_pending": consumer_info.num_pending,
+                "num_ack_pending": consumer_info.num_ack_pending,
+                "num_redelivered": consumer_info.num_redelivered,
+            }
+        except Exception:
+            old_state = {"error": "Could not get consumer state"}
+
+        # Delete the consumer
+        await js.delete_consumer(STREAM_NAME, CONSUMER_CONFIG.durable_name)
+        logger.info(f"Deleted consumer {CONSUMER_CONFIG.durable_name}")
+
+        # Recreate the consumer
+        await js.add_consumer(stream=STREAM_NAME, config=CONSUMER_CONFIG)
+        logger.info(f"Recreated consumer {CONSUMER_CONFIG.durable_name}")
+
+        # Get new consumer state
+        consumer_info = await js.consumer_info(
+            STREAM_NAME, CONSUMER_CONFIG.durable_name
+        )
+        new_state = {
+            "num_pending": consumer_info.num_pending,
+            "num_ack_pending": consumer_info.num_ack_pending,
+            "num_redelivered": consumer_info.num_redelivered,
+        }
+
+        return {
+            "success": True,
+            "message": "Consumer reset successfully. Workers will reconnect automatically.",
+            "old_state": old_state,
+            "new_state": new_state,
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to reset consumer: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+        }
