@@ -1263,7 +1263,6 @@ async def extract_from_chunk(
         model=MODEL,
         messages=messages,
         response_format={"type": "json_object"},
-        max_tokens=16384,
     )
 
     raw_content = response.choices[0].message.content

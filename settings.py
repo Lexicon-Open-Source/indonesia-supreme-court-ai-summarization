@@ -27,12 +27,6 @@ class Settings(BaseSettings):
     crawler_db_pass: str
     crawler_db_schema: str = "bo_crawler_v1"
 
-    # Case database (bo_v1 schema)
-    case_db_addr: str
-    case_db_user: str
-    case_db_pass: str
-    case_db_schema: str = "bo_v1"
-
     nats__url: str
     nats__num_of_summarizer_consumer_instances: int = 3
     async_http_request_timeout: int = 300
@@ -80,11 +74,9 @@ def _decode_and_save_credentials(base64_credentials: str) -> str:
 def get_settings():
     settings = Settings()
 
-    # URL encode credentials for both databases
+    # URL encode database credentials
     settings.crawler_db_user = urllib.parse.quote(settings.crawler_db_user)
     settings.crawler_db_pass = urllib.parse.quote(settings.crawler_db_pass)
-    settings.case_db_user = urllib.parse.quote(settings.case_db_user)
-    settings.case_db_pass = urllib.parse.quote(settings.case_db_pass)
 
     # Set Gemini API key for litellm
     if settings.gemini_api_key:
