@@ -13,6 +13,7 @@ import sys
 from collections import deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from statistics import mean, median
 from typing import Annotated, Any
@@ -27,20 +28,18 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from datetime import datetime, timedelta, timezone
-
-from settings import _temp_credentials_file, get_settings
+from settings import QueueBackendType, _temp_credentials_file, get_settings
 from src.extraction import ExtractionStatus, LLMExtraction
 from src.io import Extraction
 from src.queue import (
-    ConsumerSettings,
     ExtractionHandler,
-    NatsConfig,
-    NatsConsumer,
-    NatsProducer,
     QueueSubject,
-    StreamSettings,
-    WorkerSettings,
+)
+from src.queue.base import BaseConsumer, BaseProducer, QueueBackend
+from src.queue.factory import (
+    QueueConfig,
+    create_consumer,
+    create_producer_from_consumer,
 )
 
 # Configure logging
@@ -128,8 +127,9 @@ class AppState:
     """Application state container."""
 
     def __init__(self):
-        self.consumer: NatsConsumer | None = None
-        self.producer: NatsProducer | None = None
+        self.consumer: BaseConsumer | None = None
+        self.producer: BaseProducer | None = None
+        self.queue_config: QueueConfig | None = None
         self.crawler_db_engine: AsyncEngine | None = None
         self.processing_times: dict[str, deque] = {
             "total": deque(maxlen=100),
@@ -247,10 +247,9 @@ def create_database_engine() -> AsyncEngine:
     settings = get_settings()
 
     crawler_engine = create_async_engine(
-        f"postgresql+asyncpg://{settings.crawler_db_user}:{settings.crawler_db_pass}"
-        f"@{settings.crawler_db_addr}/postgres",
+        settings.get_database_url(),
         future=True,
-        connect_args={"server_settings": {"search_path": settings.crawler_db_schema}},
+        connect_args=settings.get_connect_args(),
     )
 
     return crawler_engine
@@ -297,24 +296,22 @@ async def get_crawler_db() -> AsyncEngine:
     return app_state.crawler_db_engine
 
 
-
-
-async def get_producer() -> NatsProducer:
-    """Get NATS producer."""
+async def get_producer() -> BaseProducer:
+    """Get queue producer."""
     if app_state.producer is None:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-            detail="NATS not initialized",
+            detail="Queue producer not initialized",
         )
     return app_state.producer
 
 
-async def get_consumer() -> NatsConsumer:
-    """Get NATS consumer."""
+async def get_consumer() -> BaseConsumer:
+    """Get queue consumer."""
     if app_state.consumer is None:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-            detail="NATS consumer not initialized",
+            detail="Queue consumer not initialized",
         )
     return app_state.consumer
 
@@ -322,6 +319,54 @@ async def get_consumer() -> NatsConsumer:
 # =============================================================================
 # Lifespan (Startup/Shutdown)
 # =============================================================================
+
+
+def _build_nats_kwargs(settings: Any) -> dict[str, Any]:
+    """Build NATS-specific consumer/producer kwargs."""
+    from src.queue.config import ConsumerSettings, StreamSettings, WorkerSettings
+
+    return {
+        "stream_settings": StreamSettings(),
+        "consumer_settings": ConsumerSettings(
+            ack_wait=settings.nats__ack_wait_seconds,
+            max_deliver=3,
+            max_ack_pending=10,
+        ),
+        "worker_settings": WorkerSettings(
+            num_workers=settings.get_num_consumer_instances(),
+            shutdown_timeout=60.0,
+        ),
+    }
+
+
+def _build_pubsub_kwargs(settings: Any) -> dict[str, Any]:
+    """Build Pub/Sub-specific consumer/producer kwargs."""
+    from src.queue.pubsub_config import (
+        PubSubDeadLetterSettings,
+        PubSubSubscriptionSettings,
+        PubSubTopicSettings,
+        PubSubWorkerSettings,
+    )
+
+    return {
+        "topic_settings": PubSubTopicSettings(
+            name=settings.pubsub__topic_name,
+        ),
+        "subscription_settings": PubSubSubscriptionSettings(
+            name=settings.pubsub__subscription_name,
+            topic_name=settings.pubsub__topic_name,
+            dead_letter_topic=settings.pubsub__dlq_topic_name,
+            max_delivery_attempts=3,
+        ),
+        "dead_letter_settings": PubSubDeadLetterSettings(
+            topic_name=settings.pubsub__dlq_topic_name,
+            subscription_name=settings.pubsub__dlq_subscription_name,
+        ),
+        "worker_settings": PubSubWorkerSettings(
+            num_workers=settings.get_num_consumer_instances(),
+            shutdown_timeout=60.0,
+        ),
+    }
 
 
 @asynccontextmanager
@@ -335,52 +380,65 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     app_state.crawler_db_engine = create_database_engine()
     logger.info("Database engine initialized")
 
-    # Configure NATS
-    nats_config = NatsConfig(url=settings.nats__url)
-
-    stream_settings = StreamSettings()
-
-    consumer_settings = ConsumerSettings(
-        # ack_wait=300 (5 min) with heartbeat - fast crash recovery
-        # heartbeat_interval=60 extends deadline during processing
-        max_deliver=3,
-        max_ack_pending=10,  # Allow more parallelism
+    # Configure queue backend based on settings
+    backend = (
+        QueueBackend.PUBSUB
+        if settings.queue_backend == QueueBackendType.PUBSUB
+        else QueueBackend.NATS
     )
 
-    worker_settings = WorkerSettings(
-        num_workers=settings.nats__num_of_summarizer_consumer_instances,
-        shutdown_timeout=60.0,  # Wait up to 60s for graceful shutdown
+    app_state.queue_config = QueueConfig(
+        backend=backend,
+        nats_url=settings.nats__url,
+        pubsub_project_id=settings.get_pubsub_project_id(),
+        num_workers=settings.get_num_consumer_instances(),
+        shutdown_timeout=60.0,
     )
+
+    logger.info(f"Using queue backend: {backend.value}")
 
     # Create extraction handler
     handler = ExtractionHandler(
         crawler_db_engine=app_state.crawler_db_engine,
     )
 
+    # Build backend-specific settings
+    extra_kwargs = (
+        _build_pubsub_kwargs(settings)
+        if backend == QueueBackend.PUBSUB
+        else _build_nats_kwargs(settings)
+    )
+
     # Initialize and start consumer
-    app_state.consumer = NatsConsumer(
-        nats_config=nats_config,
-        handler=handler,
-        stream_settings=stream_settings,
-        consumer_settings=consumer_settings,
-        worker_settings=worker_settings,
+    app_state.consumer = create_consumer(
+        app_state.queue_config,
+        handler,
+        **extra_kwargs,
     )
 
     try:
         await app_state.consumer.connect()
         await app_state.consumer.start()
-        logger.info(f"NATS consumer started with {worker_settings.num_workers} workers")
+        logger.info(
+            f"{backend.value.upper()} consumer started with "
+            f"{settings.get_num_consumer_instances()} workers"
+        )
 
         # Create producer from the same connection
-        app_state.producer = NatsProducer(
-            app_state.consumer._nats_client,
-            app_state.consumer._jetstream,
-            stream_settings,
+        producer_key = (
+            "topic_settings" if backend == QueueBackend.PUBSUB else "stream_settings"
         )
-        logger.info("NATS producer initialized")
+        producer_kwargs = {producer_key: extra_kwargs.get(producer_key)}
+
+        app_state.producer = create_producer_from_consumer(
+            app_state.queue_config,
+            app_state.consumer,
+            **producer_kwargs,
+        )
+        logger.info(f"{backend.value.upper()} producer initialized")
 
     except Exception as e:
-        logger.error(f"Failed to initialize NATS: {e}")
+        logger.error(f"Failed to initialize {backend.value.upper()}: {e}")
         raise
 
     # Start stale record recovery background task
@@ -437,8 +495,8 @@ async def health_check(
     crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
 ) -> HealthResponse:
     """Check API health status."""
-    # Check NATS connection
-    nats_connected = app_state.consumer is not None and app_state.consumer.is_connected
+    # Check queue connection
+    queue_connected = app_state.consumer is not None and app_state.consumer.is_connected
 
     # Check database connection
     db_connected = False
@@ -451,8 +509,8 @@ async def health_check(
         pass
 
     return HealthResponse(
-        status="healthy" if (nats_connected and db_connected) else "degraded",
-        nats_connected=nats_connected,
+        status="healthy" if (queue_connected and db_connected) else "degraded",
+        nats_connected=queue_connected,  # Kept for backwards compatibility
         database_connected=db_connected,
     )
 
@@ -476,7 +534,7 @@ async def health_check(
 async def submit_extraction(
     payload: ExtractionRequest,
     crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
-    producer: Annotated[NatsProducer, Depends(get_producer)],
+    producer: Annotated[BaseProducer, Depends(get_producer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> JobSubmitResponse:
     """Submit extraction job to NATS queue for processing."""
@@ -752,7 +810,7 @@ async def get_pending_extraction_ids(
 async def submit_batch_extraction(
     payload: BatchExtractionRequest,
     crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
-    producer: Annotated[NatsProducer, Depends(get_producer)],
+    producer: Annotated[BaseProducer, Depends(get_producer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> BatchExtractionResponse:
     """Submit all pending extractions to NATS queue for processing."""
@@ -849,47 +907,60 @@ async def get_pending_count(
 
 
 @app.get(
-    "/nats/diagnostics",
+    "/queue/diagnostics",
     tags=["Diagnostics"],
-    summary="Get NATS stream and consumer diagnostics",
+    summary="Get queue stream and consumer diagnostics",
 )
-async def get_nats_diagnostics(
-    consumer: Annotated[NatsConsumer, Depends(get_consumer)],
+async def get_queue_diagnostics(
+    consumer: Annotated[BaseConsumer, Depends(get_consumer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict[str, Any]:
-    """Get NATS stream and consumer state for debugging."""
-    return await consumer.get_queue_stats()
+    """Get queue stream/topic and consumer/subscription state for debugging."""
+    stats = await consumer.get_queue_stats()
+    # Add backend info
+    if app_state.queue_config:
+        stats["backend"] = app_state.queue_config.backend.value
+    return stats
 
 
 @app.post(
-    "/nats/consumer/reset",
+    "/queue/consumer/reset",
     tags=["Diagnostics"],
     summary="Reset stuck consumer",
 )
-async def reset_nats_consumer(
-    consumer: Annotated[NatsConsumer, Depends(get_consumer)],
+async def reset_queue_consumer(
+    consumer: Annotated[BaseConsumer, Depends(get_consumer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict[str, Any]:
     """
-    Reset the NATS consumer by deleting and recreating it.
+    Reset the consumer.
 
-    Use when messages are stuck in "ack_pending" state from crashed consumers.
+    For NATS: deletes and recreates the consumer.
+    For Pub/Sub: seeks subscription to current time.
+    Use when messages are stuck from crashed consumers.
     """
     return await consumer.reset_consumer()
 
 
 @app.post(
-    "/nats/test-publish",
+    "/queue/test-publish",
     tags=["Diagnostics"],
     summary="Test publishing a message",
 )
-async def test_nats_publish(
-    producer: Annotated[NatsProducer, Depends(get_producer)],
+async def test_queue_publish(
+    producer: Annotated[BaseProducer, Depends(get_producer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict[str, Any]:
     """Test publishing a single message and verify it's stored."""
+    settings = get_settings()
+
+    # Determine the subject/topic based on backend
+    subject = QueueSubject.EXTRACTION.value
+    if settings.queue_backend == QueueBackendType.PUBSUB:
+        subject = settings.pubsub__topic_name
+
     result = await producer.publish(
-        subject=QueueSubject.EXTRACTION.value,
+        subject=subject,
         payload={"extraction_id": "test-message-123", "test": True},
     )
 
@@ -897,6 +968,7 @@ async def test_nats_publish(
         "success": result.success,
         "stream": result.stream,
         "sequence": result.sequence,
+        "message_id": result.message_id,
         "duplicate": result.duplicate,
         "error": result.error,
     }
@@ -908,14 +980,17 @@ async def test_nats_publish(
     summary="Get processing metrics",
 )
 async def get_metrics(
-    consumer: Annotated[NatsConsumer, Depends(get_consumer)],
+    consumer: Annotated[BaseConsumer, Depends(get_consumer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict[str, Any]:
     """Get consumer processing metrics."""
-    return {
+    metrics = {
         "consumer_metrics": consumer.metrics.to_dict(),
         "time_estimates": get_time_estimate(),
     }
+    if app_state.queue_config:
+        metrics["backend"] = app_state.queue_config.backend.value
+    return metrics
 
 
 @app.post(
@@ -941,20 +1016,35 @@ async def recover_stale_extractions(
 
 
 @app.post(
-    "/nats/stream/purge",
+    "/queue/stream/purge",
     tags=["Diagnostics"],
-    summary="Purge all messages from stream",
+    summary="Purge all messages from stream/topic",
 )
-async def purge_nats_stream(
-    consumer: Annotated[NatsConsumer, Depends(get_consumer)],
+async def purge_queue_stream(
+    consumer: Annotated[BaseConsumer, Depends(get_consumer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict[str, Any]:
     """
-    Purge all messages from the NATS stream.
+    Purge all messages from the queue stream/topic.
+
+    For NATS: Purges all messages from the stream.
+    For Pub/Sub: Seeks subscription to current time (skips unacked messages).
 
     Use this after a consumer reset to clear old/processed messages.
-    WARNING: This removes ALL messages including unprocessed ones.
+    WARNING: This removes/skips ALL messages including unprocessed ones.
     """
+    settings = get_settings()
+
+    if settings.queue_backend == QueueBackendType.PUBSUB:
+        # For Pub/Sub, use the reset_consumer which seeks to current time
+        return await consumer.reset_consumer()
+
+    # For NATS, use the stream purge
+    from src.queue.consumer import NatsConsumer
+
+    if not isinstance(consumer, NatsConsumer):
+        return {"error": "Consumer is not a NATS consumer"}
+
     if not consumer._jetstream:
         return {"error": "Not connected"}
 

@@ -5,7 +5,6 @@ Provides a clean interface for publishing extraction jobs.
 
 import json
 import logging
-from dataclasses import dataclass
 from typing import Any
 
 from nats.aio.client import Client as NATS
@@ -13,23 +12,13 @@ from nats.js import JetStreamContext
 from nats.js.api import PubAck
 from pydantic import BaseModel
 
+from .base import BaseProducer, PublishResult
 from .config import NatsConfig, QueueSubject, StreamSettings
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class PublishResult:
-    """Result of a publish operation."""
-
-    success: bool
-    stream: str | None = None
-    sequence: int | None = None
-    duplicate: bool = False
-    error: str | None = None
-
-
-class NatsProducer:
+class NatsProducer(BaseProducer):
     """
     NATS JetStream producer for publishing messages.
 
@@ -144,39 +133,7 @@ class NatsProducer:
 
         return result
 
-    async def publish_batch(
-        self,
-        extraction_ids: list[str],
-        max_concurrent: int = 10,
-    ) -> dict[str, PublishResult]:
-        """
-        Publish multiple extractions with controlled concurrency.
-
-        Args:
-            extraction_ids: List of extraction IDs to publish
-            max_concurrent: Maximum concurrent publish operations
-
-        Returns:
-            Dict mapping extraction_id to PublishResult
-        """
-        import asyncio
-
-        results: dict[str, PublishResult] = {}
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def publish_one(extraction_id: str) -> None:
-            async with semaphore:
-                results[extraction_id] = await self.publish_extraction(extraction_id)
-
-        await asyncio.gather(
-            *[publish_one(eid) for eid in extraction_ids],
-            return_exceptions=True,
-        )
-
-        success_count = sum(1 for r in results.values() if r.success)
-        logger.info(f"Published {success_count}/{len(extraction_ids)} extractions")
-
-        return results
+    # publish_batch is inherited from BaseProducer
 
 
 class ProducerFactory:
