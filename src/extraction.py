@@ -1278,6 +1278,55 @@ async def extract_from_chunk(
         cleaned_content = cleaned_content[:-3]
     cleaned_content = cleaned_content.strip()
 
+    # Sanitize control characters inside JSON strings
+    # This fixes LLM responses that contain unescaped newlines/tabs in strings
+    def sanitize_json_control_chars(s: str) -> str:
+        """
+        Escape control characters inside JSON string values.
+        Control chars (0x00-0x1F) must be escaped when inside JSON strings.
+        """
+        chars = []
+        in_string = False
+        i = 0
+        while i < len(s):
+            char = s[i]
+
+            if not in_string:
+                # Outside string - just copy characters
+                if char == '"':
+                    in_string = True
+                chars.append(char)
+                i += 1
+            else:
+                # Inside string
+                if char == "\\" and i + 1 < len(s):
+                    # Escape sequence - copy both chars
+                    chars.append(s[i : i + 2])
+                    i += 2
+                elif char == '"':
+                    # End of string
+                    in_string = False
+                    chars.append(char)
+                    i += 1
+                elif ord(char) < 32:
+                    # Control character - escape it
+                    if char == "\n":
+                        chars.append("\\n")
+                    elif char == "\r":
+                        chars.append("\\r")
+                    elif char == "\t":
+                        chars.append("\\t")
+                    else:
+                        chars.append(f"\\u{ord(char):04x}")
+                    i += 1
+                else:
+                    chars.append(char)
+                    i += 1
+
+        return "".join(chars)
+
+    cleaned_content = sanitize_json_control_chars(cleaned_content)
+
     parsed_json = None
     try:
         parsed_json = json.loads(cleaned_content)
@@ -1289,20 +1338,6 @@ async def extract_from_chunk(
 
     try:
         result = ExtractionResult(**parsed_json)
-
-        # Check if result is mostly empty
-        non_null_fields = sum(
-            1 for v in result.model_dump().values() if v is not None
-        )
-        logger.info(
-            f"Chunk {chunk_number}: extracted {non_null_fields} non-null fields"
-        )
-
-        if non_null_fields <= 1:  # Only extraction_confidence or nothing
-            logger.warning(
-                f"Chunk {chunk_number} extraction mostly empty. "
-                f"Raw response preview: {raw_content[:200]}"
-            )
     except Exception as e:
         logger.error(f"Failed to validate extraction from chunk {chunk_number}: {e}")
         logger.error(
@@ -1310,6 +1345,16 @@ async def extract_from_chunk(
         )
         logger.error(f"Traceback:\n{traceback.format_exc()}")
         raise
+
+    # Check if result is mostly empty
+    non_null_fields = sum(1 for v in result.model_dump().values() if v is not None)
+    logger.info(f"Chunk {chunk_number}: extracted {non_null_fields} non-null fields")
+
+    if non_null_fields <= 1:  # Only extraction_confidence or nothing
+        logger.warning(
+            f"Chunk {chunk_number} extraction mostly empty. "
+            f"Raw response preview: {raw_content[:200]}"
+        )
 
     logger.debug(f"Successfully extracted from chunk {chunk_number}")
     return result
