@@ -37,8 +37,6 @@ from settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-# LLM Model configuration
-MODEL = "gemini/gemini-2.5-flash"
 
 
 # =============================================================================
@@ -1260,8 +1258,9 @@ async def extract_from_chunk(
         },
     ]
 
+    settings = get_settings()
     response = await acompletion(
-        model=MODEL,
+        model=settings.extraction_model,
         messages=messages,
         response_format={"type": "json_object"},
     )
@@ -1388,8 +1387,9 @@ async def generate_summary_id(extraction_result: dict[str, Any]) -> str:
         },
     ]
 
+    settings = get_settings()
     response = await acompletion(
-        model=MODEL,
+        model=settings.extraction_model,
         messages=messages,
     )
 
@@ -1413,8 +1413,9 @@ async def generate_summary_en(extraction_result: dict[str, Any]) -> str:
         },
     ]
 
+    settings = get_settings()
     response = await acompletion(
-        model=MODEL,
+        model=settings.extraction_model,
         messages=messages,
     )
 

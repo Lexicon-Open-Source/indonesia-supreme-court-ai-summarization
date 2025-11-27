@@ -938,3 +938,47 @@ async def recover_stale_extractions(
         "recovered_count": recovered,
         "stale_timeout_minutes": STALE_RECORD_TIMEOUT_MINUTES,
     }
+
+
+@app.post(
+    "/nats/stream/purge",
+    tags=["Diagnostics"],
+    summary="Purge all messages from stream",
+)
+async def purge_nats_stream(
+    consumer: Annotated[NatsConsumer, Depends(get_consumer)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict[str, Any]:
+    """
+    Purge all messages from the NATS stream.
+
+    Use this after a consumer reset to clear old/processed messages.
+    WARNING: This removes ALL messages including unprocessed ones.
+    """
+    if not consumer._jetstream:
+        return {"error": "Not connected"}
+
+    try:
+        stream_name = consumer.stream_settings.name
+
+        # Get current state
+        old_info = await consumer._jetstream.stream_info(stream_name)
+        old_count = old_info.state.messages
+
+        # Purge all messages
+        await consumer._jetstream.purge_stream(stream_name)
+
+        # Get new state
+        new_info = await consumer._jetstream.stream_info(stream_name)
+        new_count = new_info.state.messages
+
+        logger.info(f"Purged stream {stream_name}: {old_count} -> {new_count} messages")
+        return {
+            "success": True,
+            "stream": stream_name,
+            "messages_purged": old_count - new_count,
+            "messages_remaining": new_count,
+        }
+    except Exception as e:
+        logger.error(f"Failed to purge stream: {e}")
+        return {"error": str(e)}
