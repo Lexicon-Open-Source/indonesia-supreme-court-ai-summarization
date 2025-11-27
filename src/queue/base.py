@@ -171,6 +171,22 @@ class BaseProducer(ABC):
         """Check if producer is connected to the queue backend."""
         pass
 
+    async def connect(self) -> None:
+        """Connect to the queue backend and initialize resources.
+
+        Default is no-op for producers that don't need explicit connection.
+        Override in subclasses that need initialization (e.g., PubSubProducer).
+        """
+        pass
+
+    async def close(self) -> None:
+        """Close the connection to the queue backend.
+
+        Default is no-op for producers that share connections.
+        Override in subclasses that own their connections.
+        """
+        pass
+
     @abstractmethod
     async def publish(
         self,

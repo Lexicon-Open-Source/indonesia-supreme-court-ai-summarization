@@ -435,6 +435,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             app_state.consumer,
             **producer_kwargs,
         )
+        await app_state.producer.connect()
         logger.info(f"{backend.value.upper()} producer initialized")
 
     except Exception as e:
