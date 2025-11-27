@@ -116,6 +116,10 @@ class DefendantInfo(BaseModel):
     alias: str | None = Field(
         default=None, description="Nama alias/panggilan terdakwa jika ada"
     )
+    patronymic: str | None = Field(
+        default=None,
+        description="Nama keturunan terdakwa (BIN/BINTI diikuti nama ayah)",
+    )
     place_of_birth: str | None = Field(
         default=None, description="Kota atau tempat kelahiran terdakwa"
     )

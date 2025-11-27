@@ -84,6 +84,7 @@ Complete defendant information with structured address.
   "defendant": {
     "name": "ISHAK EFENDI",
     "alias": null,
+    "patronymic": "BIN AHMAD",
     "place_of_birth": "Api-api (Bengkalis)",
     "date_of_birth": "1963-05-03",
     "age": 70,
@@ -109,6 +110,7 @@ Complete defendant information with structured address.
 |-------|------|-------------|
 | `name` | string | Nama lengkap terdakwa |
 | `alias` | string | Nama alias/panggilan (jika ada) |
+| `patronymic` | string | Nama keturunan (BIN/BINTI diikuti nama ayah) |
 | `place_of_birth` | string | Tempat lahir |
 | `date_of_birth` | string | Tanggal lahir (YYYY-MM-DD) |
 | `age` | integer | Umur saat putusan |
@@ -816,6 +818,7 @@ Additional data for complex cases such as appeal cases (banding/kasasi) and mult
   "defendant": {
     "name": "ISHAK EFENDI",
     "alias": null,
+    "patronymic": "BIN AHMAD",
     "place_of_birth": "Api-api (Bengkalis)",
     "date_of_birth": "1963-05-03",
     "age": 70,
