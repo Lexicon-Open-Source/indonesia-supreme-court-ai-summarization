@@ -432,6 +432,11 @@ class NatsConsumer:
         metrics.messages_processed += 1
         metrics.last_message_at = datetime.utcnow()
 
+        # Start heartbeat task to keep message alive during long processing
+        heartbeat_task = asyncio.create_task(
+            self._send_heartbeat(worker_id, msg, context.message_id)
+        )
+
         try:
             result = await self.handler.handle(msg.data, context)
 
@@ -468,12 +473,13 @@ class NatsConsumer:
                 await msg.ack()
                 metrics.messages_failed += 1
             else:
-                # NACK to trigger redelivery
-                await msg.nak()
+                # NACK with delay to trigger redelivery after backoff
+                delay_seconds = min(30 * context.delivery_count, 120)
+                await msg.nak(delay=delay_seconds)
                 metrics.messages_retried += 1
                 logger.info(
                     f"{worker_id}: Message {context.message_id} will be redelivered "
-                    f"(attempt {context.delivery_count}/{max_deliver})"
+                    f"in {delay_seconds}s (attempt {context.delivery_count}/{max_deliver})"
                 )
 
         except PermanentError as e:
@@ -492,8 +498,45 @@ class NatsConsumer:
                 await msg.ack()
                 metrics.messages_failed += 1
             else:
-                await msg.nak()
+                delay_seconds = min(30 * context.delivery_count, 120)
+                await msg.nak(delay=delay_seconds)
                 metrics.messages_retried += 1
+
+        finally:
+            # Always stop the heartbeat task
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _send_heartbeat(
+        self, worker_id: str, msg: Msg, message_id: str
+    ) -> None:
+        """
+        Send periodic heartbeat to keep message alive during long processing.
+
+        Uses msg.in_progress() to tell NATS we're still working on the message,
+        which resets the ack_wait timer. This allows us to use shorter ack_wait
+        for faster crash recovery while still supporting long-running tasks.
+        """
+        interval = self.consumer_settings.heartbeat_interval
+        logger.debug(f"{worker_id}: Starting heartbeat for {message_id} (interval={interval}s)")
+
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await msg.in_progress()
+                    logger.debug(f"{worker_id}: Heartbeat sent for {message_id}")
+                except Exception as e:
+                    logger.warning(
+                        f"{worker_id}: Failed to send heartbeat for {message_id}: {e}"
+                    )
+                    # Don't break - try again next interval
+        except asyncio.CancelledError:
+            logger.debug(f"{worker_id}: Heartbeat stopped for {message_id}")
+            raise
 
     def _extract_context(self, msg: Msg) -> MessageContext:
         """Extract message context from NATS message."""

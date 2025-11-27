@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     nats__num_of_summarizer_consumer_instances: int = 3
     async_http_request_timeout: int = 300
 
+    # LLM extraction settings
+    extraction_chunk_size: int = 50  # Number of pages per LLM chunk
+
     # Optional: Google Cloud Storage settings
     gcp_project_id: str | None = None
     gcp_credentials_base64: str | None = None  # Base64-encoded service account JSON

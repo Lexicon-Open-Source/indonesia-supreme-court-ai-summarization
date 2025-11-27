@@ -66,8 +66,9 @@ class ConsumerSettings:
     filter_subject: str = QueueSubject.EXTRACTION.value
 
     # Acknowledgment settings
-    # How long before unacked message is redelivered (must exceed max processing time)
-    ack_wait: int = 7200  # 2 hours (increased from 1 hour for large documents)
+    # With heartbeat, we can use shorter ack_wait for faster crash recovery
+    # Heartbeat extends the deadline during legitimate long processing
+    ack_wait: int = 300  # 5 minutes - if no heartbeat, assume worker crashed
 
     # Redelivery settings
     max_deliver: int = 3  # Max attempts before message goes to DLQ
@@ -80,6 +81,9 @@ class ConsumerSettings:
     fetch_batch_size: int = 1  # Process one at a time for long-running tasks
     fetch_timeout_idle: float = 30.0  # Timeout when queue appears empty
     fetch_timeout_busy: float = 1.0  # Quick timeout when messages pending
+
+    # Heartbeat settings - keeps message alive during long processing
+    heartbeat_interval: int = 60  # Send in_progress every 60 seconds
 
     def to_consumer_config(self) -> ConsumerConfig:
         """Convert to NATS ConsumerConfig."""

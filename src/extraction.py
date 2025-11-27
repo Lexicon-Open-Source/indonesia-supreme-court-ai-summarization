@@ -33,11 +33,12 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
+from settings import get_settings
+
 logger = logging.getLogger(__name__)
 
 # LLM Model configuration
 MODEL = "gemini/gemini-2.5-flash"
-CHUNK_SIZE = 50  # Number of pages per chunk
 
 
 # =============================================================================
@@ -1183,7 +1184,7 @@ IMPORTANT: Start directly with "## Defendant Identity and Case Information", no 
 """
 
 
-def chunk_document(doc_content: dict[int, str], chunk_size: int = CHUNK_SIZE) -> list[str]:
+def chunk_document(doc_content: dict[int, str], chunk_size: int) -> list[str]:
     """
     Chunk document content into chunks of specified page size.
 
@@ -1447,9 +1448,11 @@ async def process_document_extraction(
     )
 
     # Step 1: Chunk the document
-    chunks = chunk_document(doc_content)
+    settings = get_settings()
+    chunk_size = settings.extraction_chunk_size
+    chunks = chunk_document(doc_content, chunk_size=chunk_size)
     total_chunks = len(chunks)
-    logger.info(f"Document split into {total_chunks} chunks")
+    logger.info(f"Document split into {total_chunks} chunks (chunk_size={chunk_size} pages)")
 
     if total_chunks == 0:
         logger.error(f"No chunks created for decision: {decision_number}")

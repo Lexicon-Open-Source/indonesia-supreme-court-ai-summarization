@@ -27,6 +27,8 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from datetime import datetime, timedelta, timezone
+
 from settings import _temp_credentials_file, get_settings
 from src.extraction import ExtractionStatus, LLMExtraction
 from src.io import Extraction
@@ -133,6 +135,8 @@ class AppState:
             "total": deque(maxlen=100),
             "extraction": deque(maxlen=100),
         }
+        self._stale_recovery_task: asyncio.Task | None = None
+        self._shutdown_event = asyncio.Event()
 
 
 app_state = AppState()
@@ -156,6 +160,79 @@ def update_processing_time(stage: str, duration: float) -> None:
     """Record a processing time measurement."""
     if stage in app_state.processing_times:
         app_state.processing_times[stage].append(duration)
+
+
+# Stale record recovery settings
+STALE_RECORD_TIMEOUT_MINUTES = 30  # Records stuck in PROCESSING for > 30 min
+STALE_RECOVERY_INTERVAL_SECONDS = 300  # Check every 5 minutes
+
+
+async def recover_stale_processing_records() -> int:
+    """
+    Find and reset records stuck in PROCESSING status.
+
+    Returns the number of records recovered.
+    """
+    if app_state.crawler_db_engine is None:
+        return 0
+
+    async_session = async_sessionmaker(
+        bind=app_state.crawler_db_engine, class_=AsyncSession
+    )
+
+    cutoff_time = datetime.now(timezone.utc) - timedelta(
+        minutes=STALE_RECORD_TIMEOUT_MINUTES
+    )
+
+    async with async_session() as session:
+        # Find stale PROCESSING records
+        result = await session.execute(
+            select(LLMExtraction).where(
+                LLMExtraction.status == ExtractionStatus.PROCESSING.value,
+                LLMExtraction.updated_at < cutoff_time,
+            )
+        )
+        stale_records = result.scalars().all()
+
+        if not stale_records:
+            return 0
+
+        # Reset them to PENDING so they can be reprocessed
+        for record in stale_records:
+            logger.warning(
+                f"Recovering stale record: {record.extraction_id} "
+                f"(stuck since {record.updated_at})"
+            )
+            record.status = ExtractionStatus.PENDING.value
+            record.updated_at = datetime.now(timezone.utc)
+            session.add(record)
+
+        await session.commit()
+        logger.info(f"Recovered {len(stale_records)} stale PROCESSING records")
+        return len(stale_records)
+
+
+async def stale_record_recovery_loop() -> None:
+    """Background task that periodically recovers stale records."""
+    logger.info(
+        f"Starting stale record recovery (interval={STALE_RECOVERY_INTERVAL_SECONDS}s, "
+        f"timeout={STALE_RECORD_TIMEOUT_MINUTES}min)"
+    )
+
+    while not app_state._shutdown_event.is_set():
+        try:
+            await asyncio.sleep(STALE_RECOVERY_INTERVAL_SECONDS)
+            if app_state._shutdown_event.is_set():
+                break
+            recovered = await recover_stale_processing_records()
+            if recovered > 0:
+                logger.info(f"Stale recovery: reset {recovered} stuck records")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in stale record recovery: {e}")
+
+    logger.info("Stale record recovery stopped")
 
 
 # =============================================================================
@@ -264,7 +341,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     stream_settings = StreamSettings()
 
     consumer_settings = ConsumerSettings(
-        ack_wait=7200,  # 2 hours for large documents
+        # ack_wait=300 (5 min) with heartbeat - fast crash recovery
+        # heartbeat_interval=60 extends deadline during processing
         max_deliver=3,
         max_ack_pending=10,  # Allow more parallelism
     )
@@ -305,11 +383,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         logger.error(f"Failed to initialize NATS: {e}")
         raise
 
+    # Start stale record recovery background task
+    app_state._stale_recovery_task = asyncio.create_task(
+        stale_record_recovery_loop(),
+        name="stale-record-recovery",
+    )
+    logger.info("Stale record recovery task started")
+
     logger.info("Startup complete")
     yield
 
     # Shutdown
     logger.info("Shutting down extraction API")
+
+    # Stop stale record recovery
+    app_state._shutdown_event.set()
+    if app_state._stale_recovery_task:
+        app_state._stale_recovery_task.cancel()
+        try:
+            await app_state._stale_recovery_task
+        except asyncio.CancelledError:
+            pass
 
     if app_state.consumer:
         await app_state.consumer.shutdown()
@@ -821,4 +915,26 @@ async def get_metrics(
     return {
         "consumer_metrics": consumer.metrics.to_dict(),
         "time_estimates": get_time_estimate(),
+    }
+
+
+@app.post(
+    "/extractions/recover-stale",
+    tags=["Diagnostics"],
+    summary="Recover stale PROCESSING records",
+)
+async def recover_stale_extractions(
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict[str, Any]:
+    """
+    Manually trigger recovery of stale PROCESSING records.
+
+    Records stuck in PROCESSING for more than 30 minutes will be reset
+    to PENDING so they can be reprocessed.
+    """
+    recovered = await recover_stale_processing_records()
+    return {
+        "message": f"Recovered {recovered} stale records",
+        "recovered_count": recovered,
+        "stale_timeout_minutes": STALE_RECORD_TIMEOUT_MINUTES,
     }
