@@ -21,8 +21,7 @@ RUN apt-get update && \
     tesseract-ocr \
     tesseract-ocr-ind \
     ca-certificates \
-    python3-dev \
-    default-libmysqlclient-dev && \
+    python3-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -33,7 +32,7 @@ RUN curl -LsSf https://astral.sh/uv/0.9.10/install.sh | sh && \
 # Copy application files
 COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
-COPY main.py cli.py contexts.py settings.py nats_consumer.py entrypoint.sh ./
+COPY main.py cli.py settings.py entrypoint.sh ./
 
 # Make entrypoint executable
 RUN chmod u+x entrypoint.sh
