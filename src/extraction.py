@@ -202,17 +202,37 @@ class Judge(BaseModel):
     )
 
 
+class Prosecutor(BaseModel):
+    """Prosecutor information."""
+
+    name: str | None = Field(default=None, description="Nama Jaksa Penuntut Umum")
+    role: str | None = Field(
+        default=None,
+        description="Jabatan/peran jaksa jika ada",
+    )
+
+
+class CourtClerk(BaseModel):
+    """Court clerk information."""
+
+    name: str | None = Field(default=None, description="Nama Panitera Pengganti")
+    role: str | None = Field(
+        default=None,
+        description="Jabatan/peran panitera jika ada",
+    )
+
+
 class CourtPersonnel(BaseModel):
     """All court personnel involved in the case."""
 
     judges: list[Judge] | None = Field(
         default=None, description="Daftar hakim yang menangani perkara"
     )
-    prosecutors: list[str] | None = Field(
-        default=None, description="Nama-nama Jaksa Penuntut Umum"
+    prosecutors: list[Prosecutor] | None = Field(
+        default=None, description="Daftar Jaksa Penuntut Umum"
     )
-    court_clerks: list[str] | None = Field(
-        default=None, description="Nama-nama Panitera Pengganti"
+    court_clerks: list[CourtClerk] | None = Field(
+        default=None, description="Daftar Panitera Pengganti"
     )
 
 
@@ -885,181 +905,29 @@ class LLMExtraction(SQLModel, table=True):
     )
 
 
-# JSON Schema description for the extraction output
-EXTRACTION_JSON_SCHEMA = """
-The output must be a valid JSON object with this structure:
+def _get_extraction_json_schema() -> str:
+    """
+    Generate JSON schema from ExtractionResult model.
 
-{
-  "defendant": {
-    "name": "string or null",
-    "alias": "string or null",
-    "place_of_birth": "string or null",
-    "date_of_birth": "YYYY-MM-DD or null",
-    "age": "integer or null",
-    "gender": "Laki-laki/Perempuan or null",
-    "citizenship": "string or null",
-    "address": {
-      "street": "string or null",
-      "rt_rw": "string or null",
-      "kelurahan": "string or null",
-      "kecamatan": "string or null",
-      "city": "string or null",
-      "province": "string or null",
-      "full_address": "string or null"
-    },
-    "religion": "string or null",
-    "occupation": "string or null",
-    "education": "string or null"
-  },
-  "legal_counsels": [
-    {
-      "name": "string or null",
-      "office_name": "string or null",
-      "office_address": "string or null"
-    }
-  ],
-  "court": {
-    "case_register_number": "string or null",
-    "verdict_number": "string or null",
-    "court_name": "string or null",
-    "court_level": "Pengadilan Negeri/Pengadilan Tinggi/Mahkamah Agung or null",
-    "province": "string or null",
-    "city": "string or null"
-  },
-  "court_personnel": {
-    "judges": [{"name": "string", "role": "Ketua Majelis/Hakim Anggota"}],
-    "prosecutors": ["string"],
-    "court_clerks": ["string"]
-  },
-  "indictment": {
-    "type": "Tunggal/Alternatif/Subsidiair/Kumulatif/Campuran or null",
-    "chronology": "string or null",
-    "crime_location": "string or null",
-    "crime_period": {
-      "start_date": "YYYY-MM-DD or null",
-      "end_date": "YYYY-MM-DD or null",
-      "description": "string or null"
-    },
-    "cited_articles": [
-      {
-        "article": "string",
-        "law_name": "string",
-        "law_number": "string or null",
-        "law_year": "integer or null",
-        "full_citation": "string"
-      }
-    ],
-    "defense_exception_status": "Ditolak/Diterima/Tidak Ada or null"
-  },
-  "prosecution_demand": {
-    "date": "YYYY-MM-DD or null",
-    "articles": [{"article": "string", "law_name": "string", "full_citation": "string"}],
-    "content": "string or null",
-    "prison_sentence_months": "float or null",
-    "prison_sentence_description": "string or null",
-    "fine_amount": "float or null",
-    "fine_subsidiary_confinement_months": "integer or null",
-    "restitution_amount": "float or null",
-    "restitution_subsidiary_type": "kurungan/penjara or null",
-    "restitution_subsidiary_duration_months": "integer or null"
-  },
-  "legal_facts": {
-    "organizational_structure": ["string"],
-    "standard_procedures": ["string"],
-    "violations": ["string"],
-    "financial_irregularities": ["string"],
-    "witness_testimonies": ["string"],
-    "documentary_evidence": ["string"],
-    "other_facts": ["string"]
-  },
-  "judicial_considerations": {
-    "aggravating_factors": ["string"],
-    "mitigating_factors": ["string"]
-  },
-  "verdict": {
-    "number": "string or null",
-    "date": "YYYY-MM-DD or null",
-    "day": "string or null",
-    "year": "integer or null",
-    "result": "guilty/partially_guilty/not_guilty/acquitted or null",
-    "primary_charge_proven": "boolean or null",
-    "subsidiary_charge_proven": "boolean or null",
-    "proven_articles": [
-      {
-        "article": "Pasal X Ayat (Y)",
-        "law_name": "nama undang-undang",
-        "law_number": "string or null",
-        "law_year": "integer or null",
-        "full_citation": "kutipan lengkap pasal jo. juncto"
-      }
-    ],
-    "ruling_contents": ["string"],
-    "sentences": {
-      "imprisonment": {"duration_months": "integer or null", "description": "string or null"},
-      "fine": {"amount": "float or null", "subsidiary_confinement_months": "integer or null"},
-      "restitution": {
-        "amount": "float or null",
-        "already_paid": "float or null",
-        "remaining": "float or null",
-        "subsidiary_type": "kurungan/penjara or null",
-        "subsidiary_duration_months": "integer or null"
-      }
-    }
-  },
-  "state_loss": {
-    "auditor": "string or null",
-    "audit_report_number": "string or null",
-    "audit_report_date": "YYYY-MM-DD or null",
-    "indicted_amount": "float or null",
-    "proven_amount": "float or null",
-    "returned_amount": "float or null",
-    "remaining_due": "float or null",
-    "currency": "IDR",
-    "perpetrators_proceeds": [{"name": "string", "amount": "float", "role": "string"}]
-  },
-  "case_metadata": {
-    "crime_category": "string or null",
-    "crime_subcategory": "string or null",
-    "institution_involved": "string or null",
-    "related_cases": [
-      {"defendant_name": "string", "case_number": "string or null", "status": "string", "relationship": "string"}
-    ]
-  },
-  "additional_case_data": {
-    "detention_history": [
-      {"stage": "string", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "duration_days": "integer", "location": "string"}
-    ],
-    "lower_court_decision": {
-      "court_name": "string or null",
-      "verdict_number": "string or null",
-      "verdict_date": "YYYY-MM-DD or null",
-      "primary_charge_ruling": "string or null",
-      "subsidiary_charge_ruling": "string or null",
-      "sentence": {"imprisonment": "string", "fine": "string", "restitution": "string"}
-    },
-    "appeal_process": {
-      "applicant": "string or null",
-      "request_date": "YYYY-MM-DD or null",
-      "registration_date": "YYYY-MM-DD or null",
-      "notification_to_defendant": "YYYY-MM-DD or null",
-      "notification_to_prosecutor": "YYYY-MM-DD or null",
-      "memorandum_filed": "boolean or null",
-      "memorandum_date": "YYYY-MM-DD or null",
-      "contra_memorandum_filed": "boolean or null",
-      "contra_memorandum_date": "YYYY-MM-DD or null",
-      "judge_notes": "string or null"
-    },
-    "evidence_inventory": {
-      "returned_to_defendant": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "returned_to_third_party": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "confiscated_for_state": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "destroyed": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "attached_to_case_file": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "used_in_other_case": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}]
-    }
-  },
-  "extraction_confidence": "float between 0.0 and 1.0"
-}
+    This includes all field descriptions from the Pydantic model,
+    ensuring the LLM has full context for each field.
+    """
+    schema = ExtractionResult.model_json_schema()
+    return json.dumps(schema, indent=2, ensure_ascii=False)
+
+
+# Generate schema with descriptions from Pydantic model
+EXTRACTION_JSON_SCHEMA = f"""
+The output must be a valid JSON object conforming to this schema:
+
+{_get_extraction_json_schema()}
+
+Key formatting rules:
+- Use null for fields where information is not found
+- Dates must be in YYYY-MM-DD format
+- Monetary values must be numbers without currency symbols (e.g., 1000000000 not "Rp 1.000.000.000")
+- Prison sentences in months (e.g., "1 tahun 6 bulan" = 18)
+- extraction_confidence must be a float between 0.0 and 1.0
 """
 
 # System prompt for extraction
