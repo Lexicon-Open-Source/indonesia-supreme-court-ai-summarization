@@ -66,7 +66,6 @@ class ExceptionStatus(str, Enum):
 
 class VerdictResult(str, Enum):
     GUILTY = "guilty"  # Terbukti bersalah
-    PARTIALLY_GUILTY = "partially_guilty"  # Sebagian terbukti
     NOT_GUILTY = "not_guilty"  # Bebas
     ACQUITTED = "acquitted"  # Lepas dari segala tuntutan
 
@@ -439,7 +438,7 @@ class Verdict(BaseModel):
     year: int | None = Field(default=None, description="Tahun putusan")
     result: str | None = Field(
         default=None,
-        description="Hasil putusan (guilty/partially_guilty/not_guilty/acquitted)",
+        description="Hasil putusan (guilty/not_guilty/acquitted)",
     )
     primary_charge_proven: bool | None = Field(
         default=None, description="Apakah dakwaan primer terbukti"
