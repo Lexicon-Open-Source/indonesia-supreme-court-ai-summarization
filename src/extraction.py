@@ -1347,6 +1347,40 @@ async def _call_extraction_llm(
     return result
 
 
+async def _try_model_with_retries(
+    messages: list[dict],
+    model: str,
+    chunk_number: int,
+    max_attempts: int = 3,
+) -> ExtractionResult | None:
+    """
+    Try a model with retries. Returns None if all attempts fail.
+
+    Raises TruncationError immediately (no point retrying same model).
+    """
+    for attempt in range(max_attempts):
+        try:
+            return await _call_extraction_llm(messages, model, chunk_number)
+        except TruncationError:
+            # Don't retry truncation with same model
+            raise
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"Chunk {chunk_number}: JSON parse error with {model} "
+                f"(attempt {attempt + 1}/{max_attempts}): {e}"
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            logger.warning(
+                f"Chunk {chunk_number}: Error with {model} "
+                f"(attempt {attempt + 1}/{max_attempts}): {e}"
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 ** attempt)
+    return None
+
+
 async def extract_from_chunk(
     chunk_content: str,
     current_extraction: dict[str, Any],
@@ -1356,7 +1390,8 @@ async def extract_from_chunk(
     """
     Extract information from a single document chunk using LLM.
 
-    Tries the primary model first, falls back to larger model on truncation/error.
+    Tries models in order: primary → fallback → fallback_2
+    Falls back on truncation or persistent errors.
 
     Args:
         chunk_content: Text content of the chunk
@@ -1383,65 +1418,51 @@ async def extract_from_chunk(
     ]
 
     settings = get_settings()
-    primary_model = settings.extraction_model
-    fallback_model = settings.extraction_fallback_model
 
-    # Try primary model first
+    # Build model chain (skip None/empty and duplicates)
+    model_chain = []
+    seen = set()
+    for model in [
+        settings.extraction_model,
+        settings.extraction_fallback_model,
+        settings.extraction_fallback_model_2,
+    ]:
+        if model and model not in seen:
+            model_chain.append(model)
+            seen.add(model)
+
+    if not model_chain:
+        raise ValueError("No extraction models configured")
+
+    logger.debug(f"Chunk {chunk_number}: Model chain: {' → '.join(model_chain)}")
+
     last_error = None
-    for attempt in range(3):  # 3 attempts with primary model
+    for i, model in enumerate(model_chain):
+        model_label = "Primary" if i == 0 else f"Fallback-{i}"
         try:
-            return await _call_extraction_llm(messages, primary_model, chunk_number)
-        except TruncationError as e:
-            logger.warning(f"Chunk {chunk_number}: {e} (attempt {attempt + 1}/3)")
-            last_error = e
-            # Don't retry truncation with same model, go to fallback
-            break
-        except json.JSONDecodeError as e:
-            logger.warning(
-                f"Chunk {chunk_number}: JSON parse error with {primary_model} "
-                f"(attempt {attempt + 1}/3): {e}"
-            )
-            last_error = e
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
-        except Exception as e:
-            logger.warning(
-                f"Chunk {chunk_number}: Error with {primary_model} "
-                f"(attempt {attempt + 1}/3): {e}"
-            )
-            last_error = e
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)
-
-    # Try fallback model if available and different from primary
-    if fallback_model and fallback_model != primary_model:
-        logger.info(
-            f"Chunk {chunk_number}: Primary model failed, falling back to {fallback_model}"
-        )
-        for attempt in range(3):  # 3 attempts with fallback model
-            try:
-                result = await _call_extraction_llm(messages, fallback_model, chunk_number)
-                logger.info(
-                    f"Chunk {chunk_number}: Fallback model {fallback_model} succeeded"
-                )
+            result = await _try_model_with_retries(messages, model, chunk_number)
+            if result is not None:
+                if i > 0:
+                    logger.info(
+                        f"Chunk {chunk_number}: {model_label} model {model} succeeded"
+                    )
                 return result
-            except TruncationError as e:
-                logger.error(
-                    f"Chunk {chunk_number}: Fallback model also truncated: {e}"
-                )
-                last_error = e
-                break  # Don't retry truncation
-            except Exception as e:
-                logger.warning(
-                    f"Chunk {chunk_number}: Fallback error (attempt {attempt + 1}/3): {e}"
-                )
-                last_error = e
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
+            # All retries failed, try next model
+            logger.warning(
+                f"Chunk {chunk_number}: {model_label} model {model} failed after retries"
+            )
+        except TruncationError as e:
+            logger.warning(
+                f"Chunk {chunk_number}: {model_label} model {model} truncated, "
+                f"trying next model..."
+            )
+            last_error = e
+            continue
 
-    # Both models failed
+    # All models failed
     logger.error(
-        f"Chunk {chunk_number}: All extraction attempts failed. Last error: {last_error}"
+        f"Chunk {chunk_number}: All {len(model_chain)} models failed. "
+        f"Last error: {last_error}"
     )
     raise last_error or ValueError(f"Extraction failed for chunk {chunk_number}")
 
