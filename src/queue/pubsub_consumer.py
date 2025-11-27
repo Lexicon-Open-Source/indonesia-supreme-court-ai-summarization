@@ -9,6 +9,7 @@ Provides reliable message consumption with:
 """
 
 import asyncio
+import functools
 import logging
 from datetime import datetime
 from typing import Any
@@ -128,21 +129,37 @@ class PubSubConsumer(BaseConsumer):
 
     async def _ensure_topic(self, topic_path: str) -> None:
         """Ensure the Pub/Sub topic exists."""
+        loop = asyncio.get_running_loop()
         try:
-            self._publisher.get_topic(request={"topic": topic_path})
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._publisher.get_topic, request={"topic": topic_path}
+                ),
+            )
             logger.debug(f"Topic {topic_path} exists")
         except Exception as e:
             if "NOT_FOUND" in str(e):
-                self._publisher.create_topic(request={"name": topic_path})
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._publisher.create_topic, request={"name": topic_path}
+                    ),
+                )
                 logger.info(f"Created topic {topic_path}")
             else:
                 raise
 
     async def _ensure_subscription(self) -> None:
         """Ensure the main subscription exists with correct config."""
+        loop = asyncio.get_running_loop()
         try:
-            self._subscriber.get_subscription(
-                request={"subscription": self.subscription_path}
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._subscriber.get_subscription,
+                    request={"subscription": self.subscription_path},
+                ),
             )
             logger.debug(f"Subscription {self.subscription_path} exists")
         except Exception as e:
@@ -171,20 +188,30 @@ class PubSubConsumer(BaseConsumer):
                     request_kwargs["dead_letter_policy"] = dead_letter_policy
 
                 request = Subscription(**request_kwargs)
-                self._subscriber.create_subscription(request=request)
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._subscriber.create_subscription, request=request
+                    ),
+                )
                 logger.info(f"Created subscription {self.subscription_path}")
             else:
                 raise
 
     async def _ensure_dlq_subscription(self) -> None:
         """Ensure the dead letter subscription exists."""
+        loop = asyncio.get_running_loop()
         dlq_subscription_path = (
             f"projects/{self.pubsub_config.project_id}/subscriptions/"
             f"{self.dead_letter_settings.subscription_name}"
         )
         try:
-            self._subscriber.get_subscription(
-                request={"subscription": dlq_subscription_path}
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._subscriber.get_subscription,
+                    request={"subscription": dlq_subscription_path},
+                ),
             )
             logger.debug(f"DLQ subscription {dlq_subscription_path} exists")
         except Exception as e:
@@ -192,9 +219,16 @@ class PubSubConsumer(BaseConsumer):
                 request = Subscription(
                     name=dlq_subscription_path,
                     topic=self.dlq_topic_path,
-                    ack_deadline_seconds=self.dead_letter_settings.ack_deadline_seconds,
+                    ack_deadline_seconds=(
+                        self.dead_letter_settings.ack_deadline_seconds
+                    ),
                 )
-                self._subscriber.create_subscription(request=request)
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._subscriber.create_subscription, request=request
+                    ),
+                )
                 logger.info(f"Created DLQ subscription {dlq_subscription_path}")
             else:
                 raise
@@ -250,12 +284,14 @@ class PubSubConsumer(BaseConsumer):
                 for received_message in response.received_messages:
                     if self._shutdown_event.is_set():
                         # NACK messages received during shutdown
+                        # Capture ack_id by value to avoid closure race condition
+                        ack_id = received_message.ack_id
                         await asyncio.get_event_loop().run_in_executor(
                             None,
-                            lambda: self._subscriber.modify_ack_deadline(
+                            lambda aid=ack_id: self._subscriber.modify_ack_deadline(
                                 request={
                                     "subscription": self.subscription_path,
-                                    "ack_ids": [received_message.ack_id],
+                                    "ack_ids": [aid],
                                     "ack_deadline_seconds": 0,  # Immediate redelivery
                                 }
                             ),
@@ -556,9 +592,14 @@ class PubSubConsumer(BaseConsumer):
             return {"error": "Not connected"}
 
         try:
-            # Get subscription details
-            subscription = self._subscriber.get_subscription(
-                request={"subscription": self.subscription_path}
+            # Get subscription details (run in executor to avoid blocking)
+            loop = asyncio.get_running_loop()
+            subscription = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._subscriber.get_subscription,
+                    request={"subscription": self.subscription_path},
+                ),
             )
 
             return {

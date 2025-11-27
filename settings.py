@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     # NATS configuration (used when queue_backend="nats")
     nats__url: str | None = None
     nats__num_of_summarizer_consumer_instances: int = 3
+    nats__ack_wait_seconds: int = 3600  # 1 hour for long-running extractions
 
     # Google Pub/Sub configuration (used when queue_backend="pubsub")
     pubsub__project_id: str | None = None

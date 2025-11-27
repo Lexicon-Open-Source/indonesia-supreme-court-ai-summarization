@@ -329,6 +329,7 @@ def _build_nats_kwargs(settings: Any) -> dict[str, Any]:
     return {
         "stream_settings": StreamSettings(),
         "consumer_settings": ConsumerSettings(
+            ack_wait=settings.nats__ack_wait_seconds,
             max_deliver=3,
             max_ack_pending=10,
         ),

@@ -164,6 +164,9 @@ def create_producer_from_consumer(
         )
 
     elif config.backend == QueueBackend.PUBSUB:
+        if not config.pubsub_project_id:
+            raise ValueError("Project ID is required for Pub/Sub backend")
+
         from .pubsub_config import PubSubConfig
         from .pubsub_consumer import PubSubConsumer
         from .pubsub_producer import PubSubProducer
@@ -208,6 +211,9 @@ async def create_standalone_producer(
         Producer instance (NatsProducer or PubSubProducer)
     """
     if config.backend == QueueBackend.NATS:
+        if not config.nats_url:
+            raise ValueError("NATS URL is required for NATS backend")
+
         from .config import NatsConfig, StreamSettings
         from .producer import ProducerFactory
 
@@ -219,6 +225,9 @@ async def create_standalone_producer(
         return factory.create_producer()
 
     elif config.backend == QueueBackend.PUBSUB:
+        if not config.pubsub_project_id:
+            raise ValueError("Project ID is required for Pub/Sub backend")
+
         from .pubsub_config import PubSubConfig
         from .pubsub_producer import PubSubProducer
 

@@ -235,12 +235,18 @@ class BaseProducer(ABC):
 
         async def publish_one(extraction_id: str) -> None:
             async with semaphore:
-                results[extraction_id] = await self.publish_extraction(extraction_id)
+                try:
+                    results[extraction_id] = await self.publish_extraction(
+                        extraction_id
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to publish {extraction_id}: {e}")
+                    results[extraction_id] = PublishResult(
+                        success=False,
+                        error=str(e),
+                    )
 
-        await asyncio.gather(
-            *[publish_one(eid) for eid in extraction_ids],
-            return_exceptions=True,
-        )
+        await asyncio.gather(*[publish_one(eid) for eid in extraction_ids])
 
         success_count = sum(1 for r in results.values() if r.success)
         logger.info(f"Published {success_count}/{len(extraction_ids)} extractions")

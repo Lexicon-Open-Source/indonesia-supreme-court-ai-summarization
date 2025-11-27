@@ -16,14 +16,17 @@ import base64
 import json
 import logging
 import os
+import shutil
 import tempfile
 import traceback
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 import aiofiles
 from httpx import AsyncClient
 from litellm import acompletion
 from pypdf import PdfReader, PdfWriter
+from pypdf.errors import PdfReadError
 from tqdm import tqdm
 
 from settings import get_settings
@@ -38,6 +41,93 @@ from src.extraction import (
 from src.io import download_from_gcs, is_gcs_url
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Merge Utilities
+# =============================================================================
+
+
+def _merge_nested_value(curr_val: Any, new_val: Any) -> Any:
+    """
+    Merge a single value, handling nested dicts and lists.
+
+    Args:
+        curr_val: Current value
+        new_val: New value from extraction
+
+    Returns:
+        Merged value
+    """
+    # If new value is a dict, recursively merge
+    if isinstance(new_val, dict) and isinstance(curr_val, dict):
+        result = curr_val.copy()
+        for key, val in new_val.items():
+            if key in curr_val:
+                result[key] = _merge_nested_value(curr_val[key], val)
+            elif val is not None:
+                # New key, add it if value is not None
+                result[key] = val
+        return result
+
+    # If new value is a list, use the new list if non-empty
+    if isinstance(new_val, list):
+        if new_val:
+            return new_val
+        # Empty list: keep current if it has data
+        if isinstance(curr_val, list) and curr_val:
+            return curr_val
+        return new_val
+
+    # For scalar values: use new value if not None
+    if new_val is not None:
+        return new_val
+
+    return curr_val
+
+
+def _deep_merge_extraction(
+    current: dict[str, Any],
+    new_result: "ExtractionResult",
+) -> dict[str, Any]:
+    """
+    Deep merge a new ExtractionResult into the current extraction dict.
+
+    This function properly handles the distinction between:
+    - Fields not present in this chunk (should not overwrite existing values)
+    - Fields explicitly set to None (should overwrite existing values)
+
+    Uses model_fields_set to determine which fields were explicitly set by the LLM.
+
+    Args:
+        current: The current accumulated extraction dict
+        new_result: The new ExtractionResult from the current chunk
+
+    Returns:
+        Updated extraction dict with properly merged values
+    """
+    # Get fields that were explicitly set in the new result
+    fields_set = new_result.model_fields_set
+
+    # Get all data including explicit Nones
+    new_data = new_result.model_dump()
+
+    # Start merging
+    result = current.copy()
+
+    for field_name in fields_set:
+        new_val = new_data.get(field_name)
+        curr_val = result.get(field_name)
+
+        if curr_val is None:
+            # No existing value, use new value if not None
+            if new_val is not None:
+                result[field_name] = new_val
+        else:
+            # Has existing value, merge appropriately
+            result[field_name] = _merge_nested_value(curr_val, new_val)
+
+    return result
 
 
 # =============================================================================
@@ -104,9 +194,28 @@ def get_pdf_page_count(pdf_path: str) -> int:
 
     Returns:
         Total number of pages
+
+    Raises:
+        ValueError: If the PDF file cannot be read or is invalid
     """
-    reader = PdfReader(pdf_path)
-    return len(reader.pages)
+    try:
+        reader = PdfReader(pdf_path)
+        return len(reader.pages)
+    except FileNotFoundError as e:
+        logger.error(f"PDF file not found: {pdf_path}")
+        raise ValueError(f"PDF file not found: {pdf_path}") from e
+    except PdfReadError as e:
+        logger.error(
+            f"Failed to read PDF file (invalid or corrupted): {pdf_path} - {e}"
+        )
+        raise ValueError(
+            f"Failed to read PDF file (invalid or corrupted): {pdf_path}"
+        ) from e
+    except Exception as e:
+        logger.error(f"Unexpected error reading PDF file: {pdf_path} - {e}")
+        raise ValueError(
+            f"Unexpected error reading PDF file: {pdf_path} - {e}"
+        ) from e
 
 
 def split_pdf_to_chunks(
@@ -124,17 +233,54 @@ def split_pdf_to_chunks(
 
     Returns:
         List of tuples: (chunk_path, start_page, end_page)
+
+    Raises:
+        ValueError: If the PDF file cannot be read or is invalid
+        IOError: If chunk files cannot be written
     """
-    reader = PdfReader(pdf_path)
-    total_pages = len(reader.pages)
+    # Read source PDF with robust error handling
+    try:
+        reader = PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+    except FileNotFoundError as e:
+        logger.error(f"PDF file not found: {pdf_path}")
+        raise ValueError(f"PDF file not found: {pdf_path}") from e
+    except PermissionError as e:
+        logger.error(f"Permission denied reading PDF file: {pdf_path} - {e}")
+        raise ValueError(f"Permission denied reading PDF file: {pdf_path}") from e
+    except PdfReadError as e:
+        logger.error(
+            f"Failed to read PDF file (invalid or corrupted): {pdf_path} - {e}"
+        )
+        raise ValueError(
+            f"Failed to read PDF file (invalid or corrupted): {pdf_path}"
+        ) from e
+    except Exception as e:
+        logger.error(f"Unexpected error reading PDF file: {pdf_path} - {e}")
+        raise ValueError(f"Unexpected error reading PDF file: {pdf_path}") from e
 
     if total_pages == 0:
-        raise ValueError("PDF has no pages")
+        raise ValueError(f"PDF has no pages: {pdf_path}")
 
     logger.info(f"Splitting PDF with {total_pages} pages into chunks of {chunk_size}")
 
+    # Setup output directory
     if output_dir is None:
         output_dir = tempfile.mkdtemp(prefix="pdf_chunks_")
+    else:
+        # Ensure output directory exists
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except PermissionError as e:
+            logger.error(
+                f"Permission denied creating output directory: {output_dir} - {e}"
+            )
+            raise IOError(
+                f"Permission denied creating output directory: {output_dir}"
+            ) from e
+        except OSError as e:
+            logger.error(f"Failed to create output directory: {output_dir} - {e}")
+            raise IOError(f"Failed to create output directory: {output_dir}") from e
 
     chunks = []
     for start_idx in range(0, total_pages, chunk_size):
@@ -142,22 +288,64 @@ def split_pdf_to_chunks(
         start_page = start_idx + 1  # 1-indexed
         end_page = end_idx  # 1-indexed
 
-        # Create chunk PDF
-        writer = PdfWriter()
-        for page_idx in range(start_idx, end_idx):
-            writer.add_page(reader.pages[page_idx])
-
         chunk_filename = f"chunk_{start_page:04d}_{end_page:04d}.pdf"
         chunk_path = os.path.join(output_dir, chunk_filename)
 
-        with open(chunk_path, "wb") as f:
-            writer.write(f)
+        # Create chunk PDF with error handling
+        try:
+            writer = PdfWriter()
+            for page_idx in range(start_idx, end_idx):
+                writer.add_page(reader.pages[page_idx])
+
+            with open(chunk_path, "wb") as f:
+                writer.write(f)
+
+        except PermissionError as e:
+            logger.error(
+                f"Permission denied writing chunk file: {chunk_path} - {e}"
+            )
+            _cleanup_partial_file(chunk_path)
+            raise IOError(
+                f"Permission denied writing chunk file: {chunk_path}"
+            ) from e
+        except (IOError, OSError) as e:
+            logger.error(f"I/O error writing chunk file: {chunk_path} - {e}")
+            _cleanup_partial_file(chunk_path)
+            raise IOError(f"I/O error writing chunk file: {chunk_path}") from e
+        except PdfReadError as e:
+            # Can occur when adding pages from corrupted source
+            logger.error(
+                f"PDF error creating chunk (pages {start_page}-{end_page}): "
+                f"{chunk_path} - {e}"
+            )
+            _cleanup_partial_file(chunk_path)
+            raise ValueError(
+                f"PDF error creating chunk (pages {start_page}-{end_page})"
+            ) from e
+        except Exception as e:
+            logger.error(
+                f"Unexpected error writing chunk file: {chunk_path} - {e}"
+            )
+            _cleanup_partial_file(chunk_path)
+            raise IOError(
+                f"Unexpected error writing chunk file: {chunk_path}"
+            ) from e
 
         chunks.append((chunk_path, start_page, end_page))
         logger.debug(f"Created chunk: {chunk_filename} (pages {start_page}-{end_page})")
 
     logger.info(f"Split PDF into {len(chunks)} chunks")
     return chunks
+
+
+def _cleanup_partial_file(file_path: str) -> None:
+    """Remove a partially written file if it exists."""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.debug(f"Cleaned up partial file: {file_path}")
+    except OSError as e:
+        logger.warning(f"Failed to clean up partial file: {file_path} - {e}")
 
 
 def pdf_to_base64(pdf_path: str) -> str:
@@ -169,9 +357,26 @@ def pdf_to_base64(pdf_path: str) -> str:
 
     Returns:
         Base64-encoded PDF content
+
+    Raises:
+        ValueError: If the PDF file cannot be read
     """
-    with open(pdf_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+    try:
+        with open(pdf_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    except FileNotFoundError as e:
+        logger.error(f"PDF file not found for base64 encoding: {pdf_path}")
+        raise ValueError(f"PDF file not found: {pdf_path}") from e
+    except OSError as e:
+        logger.error(f"IO error reading PDF file for base64 encoding: {pdf_path} - {e}")
+        raise ValueError(f"Failed to read PDF file: {pdf_path} - {e}") from e
+    except Exception as e:
+        logger.error(
+            f"Unexpected error encoding PDF to base64: {pdf_path} - {e}"
+        )
+        raise ValueError(
+            f"Unexpected error encoding PDF to base64: {pdf_path}"
+        ) from e
 
 
 # =============================================================================
@@ -372,7 +577,8 @@ async def extract_from_pdf_chunk(
                     )
                 return result
             logger.warning(
-                f"Chunk {chunk_number}: {model_label} model {model} failed after retries"
+                f"Chunk {chunk_number}: {model_label} model {model} "
+                "failed after retries"
             )
         except TruncationError as e:
             logger.warning(
@@ -437,6 +643,7 @@ async def process_document_pdf_extraction(
 
         # Step 2: Process each chunk iteratively
         current_extraction: dict[str, Any] = {}
+        successful_chunks = 0
 
         for i, (chunk_path, start_page, end_page) in enumerate(
             tqdm(chunks, desc=f"Processing {decision_number}")
@@ -458,8 +665,14 @@ async def process_document_pdf_extraction(
                     end_page=end_page,
                 )
 
-                # Update current extraction
-                current_extraction = result.model_dump(exclude_none=True)
+                # Update current extraction using deep merge
+                # This properly handles:
+                # - Fields not in this chunk (preserved from previous)
+                # - Fields explicitly set to None (can overwrite stale data)
+                current_extraction = _deep_merge_extraction(
+                    current_extraction, result
+                )
+                successful_chunks += 1
                 logger.debug(
                     f"Chunk {chunk_number} processed, "
                     f"fields extracted: {len(current_extraction)}"
@@ -469,6 +682,12 @@ async def process_document_pdf_extraction(
                 logger.error(f"Error processing chunk {chunk_number}: {e}")
                 logger.error(f"Full traceback:\n{traceback.format_exc()}")
                 continue
+
+        # Fail if no chunks were successfully processed
+        if successful_chunks == 0:
+            raise ValueError(
+                f"All {total_chunks} chunks failed for {decision_number}"
+            )
 
         # Step 3: Generate summaries
         logger.info(f"Generating summaries for {decision_number}")
@@ -482,35 +701,46 @@ async def process_document_pdf_extraction(
 
     finally:
         # Cleanup temp chunks directory
-        import shutil
-
         if os.path.exists(chunks_dir):
             shutil.rmtree(chunks_dir)
             logger.debug(f"Cleaned up chunks directory: {chunks_dir}")
 
 
-async def download_pdf_to_temp_file(uri_path: str) -> str:
+def cleanup_temp_file(temp_path: str) -> None:
     """
-    Download PDF from URI and save to temporary file.
+    Safely clean up a temporary file.
+
+    Args:
+        temp_path: Path to the temporary file to delete
+    """
+    if temp_path and os.path.exists(temp_path):
+        try:
+            os.unlink(temp_path)
+            logger.debug(f"Cleaned up temporary file: {temp_path}")
+        except OSError as e:
+            logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
+
+
+async def _download_pdf_impl(uri_path: str, temp_path: str) -> None:
+    """
+    Internal implementation for downloading PDF to a given path.
 
     Args:
         uri_path: URL to download PDF from
+        temp_path: Path to save the PDF to
 
-    Returns:
-        Path to temporary PDF file (caller responsible for cleanup)
+    Raises:
+        ValueError: If download fails
     """
     settings = get_settings()
-
-    # Create temp file
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    temp_path = temp_file.name
-    temp_file.close()
 
     async with AsyncClient(
         timeout=settings.async_http_request_timeout, follow_redirects=True
     ) as client:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            ),
             "Accept": "application/pdf,*/*",
         }
 
@@ -519,17 +749,88 @@ async def download_pdf_to_temp_file(uri_path: str) -> str:
             if response.status_code == 200:
                 async with aiofiles.open(temp_path, "wb") as f:
                     await f.write(response.content)
-                return temp_path
+                return
             else:
-                os.unlink(temp_path)
-                raise ValueError(f"Failed to download PDF: HTTP {response.status_code}")
-        except Exception as e:
+                raise ValueError(
+                    f"Failed to download PDF: HTTP {response.status_code}"
+                )
+        except ValueError:
+            # Re-raise ValueError (HTTP errors) without GCS fallback attempt
+            raise
+        except Exception:
             # Try GCS fallback if applicable
             if is_gcs_url(uri_path):
                 logger.info(f"Direct download failed, trying GCS: {uri_path}")
                 await download_from_gcs(uri_path, temp_path)
-                return temp_path
-            # Clean up on failure
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+                return
             raise
+
+
+@asynccontextmanager
+async def download_pdf_temp_file(uri_path: str) -> AsyncIterator[str]:
+    """
+    Download PDF from URI to a temporary file with automatic cleanup.
+
+    Use this as an async context manager for automatic cleanup:
+
+        async with download_pdf_temp_file(uri) as pdf_path:
+            # Use pdf_path
+            ...
+        # File is automatically deleted after the block
+
+    Args:
+        uri_path: URL to download PDF from
+
+    Yields:
+        Path to temporary PDF file
+
+    Raises:
+        ValueError: If download fails
+    """
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_path = temp_file.name
+    temp_file.close()
+
+    try:
+        await _download_pdf_impl(uri_path, temp_path)
+        yield temp_path
+    finally:
+        cleanup_temp_file(temp_path)
+
+
+async def download_pdf_to_temp_file(uri_path: str) -> str:
+    """
+    Download PDF from URI and save to temporary file.
+
+    WARNING: Caller is responsible for cleanup! Use cleanup_temp_file() or
+    os.unlink() when done. For automatic cleanup, use download_pdf_temp_file()
+    context manager instead.
+
+    Args:
+        uri_path: URL to download PDF from
+
+    Returns:
+        Path to temporary PDF file
+
+    Raises:
+        ValueError: If download fails
+
+    Example:
+        temp_path = await download_pdf_to_temp_file(uri)
+        try:
+            # Use temp_path
+            ...
+        finally:
+            cleanup_temp_file(temp_path)
+    """
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_path = temp_file.name
+    temp_file.close()
+
+    try:
+        await _download_pdf_impl(uri_path, temp_path)
+        return temp_path
+    except Exception:
+        # Clean up on failure
+        cleanup_temp_file(temp_path)
+        raise

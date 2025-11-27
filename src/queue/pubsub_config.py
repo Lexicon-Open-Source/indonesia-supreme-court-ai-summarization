@@ -59,6 +59,32 @@ class PubSubSubscriptionSettings:
     # Exactly-once delivery (requires additional setup)
     enable_exactly_once_delivery: bool = False
 
+    def __post_init__(self) -> None:
+        """Validate configuration constraints."""
+        # Pub/Sub ack_deadline_seconds must be between 10 and 600 seconds
+        if not (10 <= self.ack_deadline_seconds <= 600):
+            raise ValueError(
+                f"ack_deadline_seconds must be between 10 and 600, "
+                f"got {self.ack_deadline_seconds}"
+            )
+
+        if self.max_delivery_attempts < 1:
+            raise ValueError(
+                f"max_delivery_attempts must be at least 1, "
+                f"got {self.max_delivery_attempts}"
+            )
+
+        if self.max_messages < 1:
+            raise ValueError(
+                f"max_messages must be at least 1, got {self.max_messages}"
+            )
+
+        if self.message_retention_duration < 0:
+            raise ValueError(
+                f"message_retention_duration must be non-negative, "
+                f"got {self.message_retention_duration}"
+            )
+
 
 @dataclass
 class PubSubDeadLetterSettings:
