@@ -1,23 +1,46 @@
-"""NATS Queue module for extraction job processing.
+"""Queue module for extraction job processing.
 
-This module provides a robust NATS JetStream implementation with:
+This module provides message queue implementations with:
 - Proper ACK/NACK handling based on error types
 - Graceful shutdown with in-flight message completion
 - Dead letter queue for failed messages
 - Comprehensive metrics and monitoring
 
+Supports multiple backends:
+- NATS JetStream
+- Google Pub/Sub
+
 Usage:
-    from src.queue import NatsConsumer, NatsProducer, ExtractionHandler
+    from src.queue import create_consumer, create_producer_from_consumer, QueueConfig
+    from src.queue.base import QueueBackend
 
-    # Consumer
-    async with NatsConsumer(nats_config, handler) as consumer:
-        await consumer.start()
+    # Create consumer using factory
+    config = QueueConfig(
+        backend=QueueBackend.NATS,  # or QueueBackend.PUBSUB
+        nats_url="nats://localhost:4222",
+        # or pubsub_project_id="my-project",
+    )
+    consumer = create_consumer(config, handler)
+    await consumer.connect()
+    await consumer.start()
 
-    # Producer
-    producer = NatsProducer(nats_client, jetstream)
+    # Create producer from consumer
+    producer = create_producer_from_consumer(config, consumer)
     await producer.publish_extraction("extraction-123")
 """
 
+# Base classes and types
+from .base import (
+    BaseConsumer,
+    BaseProducer,
+    ConsumerMetrics,
+    PublishResult,
+    QueueBackend,
+    WorkerMetrics,
+    WorkerState,
+)
+
+# NATS configuration
 from .config import (
     DEFAULT_CONSUMER_SETTINGS,
     DEFAULT_DEAD_LETTER_SETTINGS,
@@ -30,12 +53,11 @@ from .config import (
     StreamSettings,
     WorkerSettings,
 )
-from .consumer import (
-    ConsumerMetrics,
-    NatsConsumer,
-    WorkerMetrics,
-    WorkerState,
-)
+
+# NATS implementation
+from .consumer import NatsConsumer
+
+# Errors
 from .errors import (
     ConnectionError,
     ConsumerError,
@@ -45,23 +67,58 @@ from .errors import (
     SkipMessageError,
     StreamError,
 )
+
+# Extraction Handler
 from .extraction_handler import (
     ExtractionHandler,
     ExtractionPayload,
 )
+
+# Factory functions
+from .factory import (
+    QueueConfig,
+    create_consumer,
+    create_producer_from_consumer,
+    create_standalone_producer,
+)
+
+# Handler
 from .handler import (
     MessageContext,
     MessageHandler,
     ProcessingResult,
 )
-from .producer import (
-    NatsProducer,
-    ProducerFactory,
-    PublishResult,
+from .producer import NatsProducer, ProducerFactory
+
+# Note: PublishResult is now in base.py, not producer.py
+# Pub/Sub configuration
+from .pubsub_config import (
+    PubSubConfig,
+    PubSubDeadLetterSettings,
+    PubSubSubscriptionSettings,
+    PubSubTopicSettings,
+    PubSubWorkerSettings,
 )
 
+# Pub/Sub implementation
+from .pubsub_consumer import PubSubConsumer
+from .pubsub_producer import PubSubProducer, PubSubProducerFactory
+
 __all__ = [
-    # Config
+    # Base classes
+    "BaseConsumer",
+    "BaseProducer",
+    "QueueBackend",
+    "ConsumerMetrics",
+    "WorkerMetrics",
+    "WorkerState",
+    "PublishResult",
+    # Factory
+    "QueueConfig",
+    "create_consumer",
+    "create_producer_from_consumer",
+    "create_standalone_producer",
+    # NATS Config
     "NatsConfig",
     "StreamSettings",
     "ConsumerSettings",
@@ -72,15 +129,20 @@ __all__ = [
     "DEFAULT_CONSUMER_SETTINGS",
     "DEFAULT_DEAD_LETTER_SETTINGS",
     "DEFAULT_WORKER_SETTINGS",
-    # Consumer
+    # NATS Implementation
     "NatsConsumer",
-    "ConsumerMetrics",
-    "WorkerMetrics",
-    "WorkerState",
-    # Producer
     "NatsProducer",
     "ProducerFactory",
-    "PublishResult",
+    # Pub/Sub Config
+    "PubSubConfig",
+    "PubSubTopicSettings",
+    "PubSubSubscriptionSettings",
+    "PubSubDeadLetterSettings",
+    "PubSubWorkerSettings",
+    # Pub/Sub Implementation
+    "PubSubConsumer",
+    "PubSubProducer",
+    "PubSubProducerFactory",
     # Handler
     "MessageHandler",
     "MessageContext",

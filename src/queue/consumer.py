@@ -11,9 +11,7 @@ Provides reliable message consumption with:
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
 from typing import Any
 
 import nats
@@ -23,6 +21,7 @@ from nats.js import JetStreamContext
 from nats.js.api import ConsumerConfig
 from nats.js.errors import NotFoundError
 
+from .base import BaseConsumer, ConsumerMetrics, WorkerMetrics
 from .config import (
     ConsumerSettings,
     DeadLetterSettings,
@@ -37,73 +36,7 @@ from .handler import MessageContext, MessageHandler
 logger = logging.getLogger(__name__)
 
 
-class WorkerState(str, Enum):
-    """Worker lifecycle states."""
-
-    STARTING = "starting"
-    RUNNING = "running"
-    DRAINING = "draining"  # Completing in-flight work before shutdown
-    STOPPED = "stopped"
-
-
-@dataclass
-class WorkerMetrics:
-    """Metrics for a single worker instance."""
-
-    messages_processed: int = 0
-    messages_succeeded: int = 0
-    messages_failed: int = 0
-    messages_skipped: int = 0
-    messages_retried: int = 0
-    total_processing_time: float = 0.0
-    last_message_at: datetime | None = None
-
-
-@dataclass
-class ConsumerMetrics:
-    """Aggregate metrics across all workers."""
-
-    workers: dict[str, WorkerMetrics] = field(default_factory=dict)
-
-    @property
-    def total_processed(self) -> int:
-        return sum(w.messages_processed for w in self.workers.values())
-
-    @property
-    def total_succeeded(self) -> int:
-        return sum(w.messages_succeeded for w in self.workers.values())
-
-    @property
-    def total_failed(self) -> int:
-        return sum(w.messages_failed for w in self.workers.values())
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "total_processed": self.total_processed,
-            "total_succeeded": self.total_succeeded,
-            "total_failed": self.total_failed,
-            "workers": {
-                name: {
-                    "processed": m.messages_processed,
-                    "succeeded": m.messages_succeeded,
-                    "failed": m.messages_failed,
-                    "skipped": m.messages_skipped,
-                    "retried": m.messages_retried,
-                    "avg_processing_time": (
-                        m.total_processing_time / m.messages_processed
-                        if m.messages_processed > 0
-                        else 0
-                    ),
-                    "last_message_at": (
-                        m.last_message_at.isoformat() if m.last_message_at else None
-                    ),
-                }
-                for name, m in self.workers.items()
-            },
-        }
-
-
-class NatsConsumer:
+class NatsConsumer(BaseConsumer):
     """
     NATS JetStream consumer with robust error handling and graceful shutdown.
 
@@ -418,7 +351,7 @@ class NatsConsumer:
 
         # Log raw message data for debugging
         try:
-            msg_data = msg.data.decode('utf-8')
+            msg_data = msg.data.decode("utf-8")
             logger.info(
                 f"{worker_id}: Processing message {context.message_id} "
                 f"(delivery {context.delivery_count}) - data: {msg_data}"
@@ -478,8 +411,9 @@ class NatsConsumer:
                 await msg.nak(delay=delay_seconds)
                 metrics.messages_retried += 1
                 logger.info(
-                    f"{worker_id}: Message {context.message_id} will be redelivered "
-                    f"in {delay_seconds}s (attempt {context.delivery_count}/{max_deliver})"
+                    f"{worker_id}: Message {context.message_id} will be "
+                    f"redelivered in {delay_seconds}s "
+                    f"(attempt {context.delivery_count}/{max_deliver})"
                 )
 
         except PermanentError as e:
@@ -510,9 +444,7 @@ class NatsConsumer:
             except asyncio.CancelledError:
                 pass
 
-    async def _send_heartbeat(
-        self, worker_id: str, msg: Msg, message_id: str
-    ) -> None:
+    async def _send_heartbeat(self, worker_id: str, msg: Msg, message_id: str) -> None:
         """
         Send periodic heartbeat to keep message alive during long processing.
 
@@ -521,7 +453,9 @@ class NatsConsumer:
         for faster crash recovery while still supporting long-running tasks.
         """
         interval = self.consumer_settings.heartbeat_interval
-        logger.debug(f"{worker_id}: Starting heartbeat for {message_id} (interval={interval}s)")
+        logger.debug(
+            f"{worker_id}: Starting heartbeat for {message_id} (interval={interval}s)"
+        )
 
         try:
             while True:

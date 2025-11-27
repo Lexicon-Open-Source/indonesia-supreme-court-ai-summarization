@@ -13,8 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from settings import ExtractionMode, get_settings
 from src.extraction import ExtractionStatus, LLMExtraction
 from src.io import Extraction
+from src.pdf_pipeline import run_pdf_extraction_pipeline
 from src.pipeline import run_extraction_pipeline
 
 from .errors import PermanentError, RetriableError, SkipMessageError
@@ -131,10 +133,12 @@ class ExtractionHandler(MessageHandler[ExtractionPayload]):
                     update(LLMExtraction)
                     .where(LLMExtraction.extraction_id == extraction_id)
                     .where(
-                        LLMExtraction.status.in_([
-                            ExtractionStatus.PENDING.value,
-                            ExtractionStatus.FAILED.value,
-                        ])
+                        LLMExtraction.status.in_(
+                            [
+                                ExtractionStatus.PENDING.value,
+                                ExtractionStatus.FAILED.value,
+                            ]
+                        )
                     )
                     .values(status=ExtractionStatus.PROCESSING.value)
                 )
@@ -174,17 +178,33 @@ class ExtractionHandler(MessageHandler[ExtractionPayload]):
 
         try:
             start_time = asyncio.get_event_loop().time()
-            logger.info(f"Calling run_extraction_pipeline for {extraction_id}")
 
-            (
-                extraction_result,
-                summary_id,
-                summary_en,
-                decision_number,
-            ) = await run_extraction_pipeline(
-                extraction_id=extraction_id,
-                crawler_db_engine=self.crawler_db_engine,
+            settings = get_settings()
+            logger.info(
+                f"Calling extraction pipeline for {extraction_id} "
+                f"(mode: {settings.extraction_mode.value})"
             )
+
+            if settings.extraction_mode == ExtractionMode.PDF:
+                (
+                    extraction_result,
+                    summary_id,
+                    summary_en,
+                    decision_number,
+                ) = await run_pdf_extraction_pipeline(
+                    extraction_id=extraction_id,
+                    crawler_db_engine=self.crawler_db_engine,
+                )
+            else:
+                (
+                    extraction_result,
+                    summary_id,
+                    summary_en,
+                    decision_number,
+                ) = await run_extraction_pipeline(
+                    extraction_id=extraction_id,
+                    crawler_db_engine=self.crawler_db_engine,
+                )
 
             duration = asyncio.get_event_loop().time() - start_time
 

@@ -1,9 +1,10 @@
-import logging
-import urllib.parse
-import os
 import base64
 import json
+import logging
+import os
 import tempfile
+import urllib.parse
+from enum import Enum
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,6 +18,18 @@ logging.basicConfig(
 _temp_credentials_file: str | None = None
 
 
+class QueueBackendType(str, Enum):
+    """Supported queue backend types."""
+    NATS = "nats"
+    PUBSUB = "pubsub"
+
+
+class ExtractionMode(str, Enum):
+    """Supported extraction modes."""
+    TEXT = "text"  # Convert PDF to text first, then send text to LLM
+    PDF = "pdf"    # Send PDF directly to LLM (Gemini native PDF support)
+
+
 class Settings(BaseSettings):
     gemini_api_key: str
     lexicon_api_key: str  # API key for X-LEXICON-API-KEY header auth (required)
@@ -27,8 +40,24 @@ class Settings(BaseSettings):
     crawler_db_pass: str
     crawler_db_schema: str = "bo_crawler_v1"
 
-    nats__url: str
+    # Queue backend selection: "nats" or "pubsub"
+    queue_backend: QueueBackendType = QueueBackendType.NATS
+
+    # Extraction mode: "text" (PDF to text) or "pdf" (direct PDF to LLM)
+    extraction_mode: ExtractionMode = ExtractionMode.TEXT
+
+    # NATS configuration (used when queue_backend="nats")
+    nats__url: str | None = None
     nats__num_of_summarizer_consumer_instances: int = 3
+
+    # Google Pub/Sub configuration (used when queue_backend="pubsub")
+    pubsub__project_id: str | None = None
+    pubsub__topic_name: str = "supreme-court-extraction"
+    pubsub__subscription_name: str = "supreme-court-extraction-sub"
+    pubsub__dlq_topic_name: str = "supreme-court-extraction-dlq"
+    pubsub__dlq_subscription_name: str = "supreme-court-extraction-dlq-sub"
+    pubsub__num_of_consumer_instances: int = 3
+
     async_http_request_timeout: int = 300
 
     # LLM extraction settings
@@ -42,6 +71,16 @@ class Settings(BaseSettings):
     gcp_credentials_base64: str | None = None  # Base64-encoded service account JSON
 
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
+
+    def get_num_consumer_instances(self) -> int:
+        """Get the number of consumer instances based on queue backend."""
+        if self.queue_backend == QueueBackendType.PUBSUB:
+            return self.pubsub__num_of_consumer_instances
+        return self.nats__num_of_summarizer_consumer_instances
+
+    def get_pubsub_project_id(self) -> str | None:
+        """Get Pub/Sub project ID, falling back to GCP project ID."""
+        return self.pubsub__project_id or self.gcp_project_id
 
 
 def _decode_and_save_credentials(base64_credentials: str) -> str:
