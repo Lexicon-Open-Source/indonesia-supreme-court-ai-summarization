@@ -247,10 +247,9 @@ def create_database_engine() -> AsyncEngine:
     settings = get_settings()
 
     crawler_engine = create_async_engine(
-        f"postgresql+asyncpg://{settings.crawler_db_user}:{settings.crawler_db_pass}"
-        f"@{settings.crawler_db_addr}/postgres",
+        settings.get_database_url(),
         future=True,
-        connect_args={"server_settings": {"search_path": settings.crawler_db_schema}},
+        connect_args=settings.get_connect_args(),
     )
 
     return crawler_engine
