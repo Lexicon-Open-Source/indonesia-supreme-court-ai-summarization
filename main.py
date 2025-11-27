@@ -1,5 +1,12 @@
+"""FastAPI application for Court Decision Extraction API.
+
+This module provides:
+- REST API endpoints for submitting and managing extractions
+- NATS JetStream consumer integration for async processing
+- Health and diagnostic endpoints
+"""
+
 import asyncio
-import json
 import logging
 import os
 import sys
@@ -8,13 +15,11 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from statistics import mean, median
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Query
 from fastapi.exceptions import HTTPException
 from fastapi.security import APIKeyHeader
-from nats.aio.client import Client as NATS
-from nats.aio.msg import Msg
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
@@ -22,23 +27,19 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from contexts import AppContexts
-from nats_consumer import (
-    CONSUMER_CONFIG,
-    STREAM_NAME,
-    STREAM_SUBJECTS,
-    SUBJECT,
-    close_nats_connection,
-    create_job_consumer_async_task,
-)
 from settings import _temp_credentials_file, get_settings
 from src.extraction import ExtractionStatus, LLMExtraction
 from src.io import Extraction
-from src.pipeline import run_extraction_pipeline
-
-# Add direct print statements for Docker logs
-print("DIRECT LOG: Starting application initialization", flush=True)
-print(f"DIRECT LOG: Python version: {sys.version}", flush=True)
+from src.queue import (
+    ConsumerSettings,
+    ExtractionHandler,
+    NatsConfig,
+    NatsConsumer,
+    NatsProducer,
+    QueueSubject,
+    StreamSettings,
+    WorkerSettings,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -52,7 +53,7 @@ for handler in logging.root.handlers:
 
 logger = logging.getLogger("extraction-api")
 
-# Set SQLAlchemy logging level to WARNING
+# Reduce SQLAlchemy and httpx logging noise
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -102,10 +103,10 @@ class HealthResponse(BaseModel):
 
 class BatchExtractionRequest(BaseModel):
     concurrency: int = Field(
-        default=5, ge=1, le=20, description="Number of concurrent extractions"
+        default=5, ge=1, le=20, description="Number of concurrent submissions"
     )
     limit: int | None = Field(
-        default=None, ge=1, description="Maximum number of extractions to process"
+        default=None, ge=1, description="Maximum number of extractions to queue"
     )
 
 
@@ -117,50 +118,65 @@ class BatchExtractionResponse(BaseModel):
 
 
 # =============================================================================
-# App Context & Processing Times
+# Application State
 # =============================================================================
 
-CONTEXTS = AppContexts()
+
+class AppState:
+    """Application state container."""
+
+    def __init__(self):
+        self.consumer: NatsConsumer | None = None
+        self.producer: NatsProducer | None = None
+        self.crawler_db_engine: AsyncEngine | None = None
+        self.processing_times: dict[str, deque] = {
+            "total": deque(maxlen=100),
+            "extraction": deque(maxlen=100),
+        }
 
 
-async def get_db_only_contexts() -> AppContexts:
-    """Get app contexts with database only (no NATS initialization)."""
-    return await CONTEXTS.get_app_contexts(init_nats=False)
-
-
-async def get_full_contexts() -> AppContexts:
-    """Get app contexts with NATS initialization."""
-    return await CONTEXTS.get_app_contexts(init_nats=True)
-
-
-PROCESSING_TIMES = {
-    "total": deque(maxlen=100),
-    "extraction": deque(maxlen=100),
-}
+app_state = AppState()
 
 
 def get_time_estimate() -> dict[str, float]:
+    """Get estimated processing times based on recent history."""
     estimates = {}
-    if len(PROCESSING_TIMES["total"]) >= 5:
-        estimates["total"] = median(PROCESSING_TIMES["total"])
-    elif len(PROCESSING_TIMES["total"]) > 0:
-        estimates["total"] = mean(PROCESSING_TIMES["total"])
-    else:
-        estimates["total"] = 120.0  # Default estimate
-
-    if len(PROCESSING_TIMES["extraction"]) >= 5:
-        estimates["extraction"] = median(PROCESSING_TIMES["extraction"])
-    elif len(PROCESSING_TIMES["extraction"]) > 0:
-        estimates["extraction"] = mean(PROCESSING_TIMES["extraction"])
-    else:
-        estimates["extraction"] = 100.0
+    for key in ["total", "extraction"]:
+        times = app_state.processing_times[key]
+        if len(times) >= 5:
+            estimates[key] = median(times)
+        elif len(times) > 0:
+            estimates[key] = mean(times)
+        else:
+            estimates[key] = 120.0 if key == "total" else 100.0
     return estimates
 
 
-def update_processing_times(stage: str, duration: float) -> None:
-    if stage in PROCESSING_TIMES:
-        PROCESSING_TIMES[stage].append(duration)
-        logger.debug(f"Updated {stage} time: {duration:.2f}s")
+def update_processing_time(stage: str, duration: float) -> None:
+    """Record a processing time measurement."""
+    if stage in app_state.processing_times:
+        app_state.processing_times[stage].append(duration)
+
+
+# =============================================================================
+# Database Setup
+# =============================================================================
+
+
+def create_database_engine() -> AsyncEngine:
+    """Create database engine for crawler database."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    settings = get_settings()
+
+    crawler_engine = create_async_engine(
+        f"postgresql+asyncpg://{settings.crawler_db_user}:{settings.crawler_db_pass}"
+        f"@{settings.crawler_db_addr}/postgres",
+        future=True,
+        connect_args={"server_settings": {"search_path": settings.crawler_db_schema}},
+    )
+
+    return crawler_engine
 
 
 # =============================================================================
@@ -173,11 +189,7 @@ API_KEY_HEADER = APIKeyHeader(name="X-LEXICON-API-KEY", auto_error=False)
 async def verify_api_key(
     api_key: Annotated[str | None, Depends(API_KEY_HEADER)],
 ) -> str:
-    """
-    Verify the API key from X-LEXICON-API-KEY header.
-
-    All requests (except /health) require a valid API key.
-    """
+    """Verify the API key from X-LEXICON-API-KEY header."""
     if not api_key:
         raise HTTPException(
             status_code=HTTPStatus.UNAUTHORIZED,
@@ -194,220 +206,150 @@ async def verify_api_key(
 
 
 # =============================================================================
+# Dependencies
+# =============================================================================
+
+
+async def get_crawler_db() -> AsyncEngine:
+    """Get crawler database engine."""
+    if app_state.crawler_db_engine is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail="Database not initialized",
+        )
+    return app_state.crawler_db_engine
+
+
+
+
+async def get_producer() -> NatsProducer:
+    """Get NATS producer."""
+    if app_state.producer is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail="NATS not initialized",
+        )
+    return app_state.producer
+
+
+async def get_consumer() -> NatsConsumer:
+    """Get NATS consumer."""
+    if app_state.consumer is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail="NATS consumer not initialized",
+        )
+    return app_state.consumer
+
+
+# =============================================================================
 # Lifespan (Startup/Shutdown)
 # =============================================================================
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
-    global CONTEXTS
-    print("DIRECT LOG: Starting up extraction API", flush=True)
-    logger.info("Starting up extraction API")
-    nats_consumer_job_connection = []
+    """Application lifespan manager."""
+    logger.info("Starting extraction API")
+
+    settings = get_settings()
+
+    # Initialize database engine
+    app_state.crawler_db_engine = create_database_engine()
+    logger.info("Database engine initialized")
+
+    # Configure NATS
+    nats_config = NatsConfig(url=settings.nats__url)
+
+    stream_settings = StreamSettings()
+
+    consumer_settings = ConsumerSettings(
+        ack_wait=7200,  # 2 hours for large documents
+        max_deliver=3,
+        max_ack_pending=10,  # Allow more parallelism
+    )
+
+    worker_settings = WorkerSettings(
+        num_workers=settings.nats__num_of_summarizer_consumer_instances,
+        shutdown_timeout=60.0,  # Wait up to 60s for graceful shutdown
+    )
+
+    # Create extraction handler
+    handler = ExtractionHandler(
+        crawler_db_engine=app_state.crawler_db_engine,
+    )
+
+    # Initialize and start consumer
+    app_state.consumer = NatsConsumer(
+        nats_config=nats_config,
+        handler=handler,
+        stream_settings=stream_settings,
+        consumer_settings=consumer_settings,
+        worker_settings=worker_settings,
+    )
 
     try:
-        contexts = await CONTEXTS.get_app_contexts()
+        await app_state.consumer.connect()
+        await app_state.consumer.start()
+        logger.info(f"NATS consumer started with {worker_settings.num_workers} workers")
 
-        # Ensure NATS stream exists
-        try:
-            js = contexts.nats_client.jetstream()
-            await js.add_stream(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
-            logger.info(f"Stream {STREAM_NAME} confirmed")
-        except Exception as e:
-            if "already exists" not in str(e):
-                logger.warning(f"Stream creation warning: {e}")
-
-        # Ensure consumer exists with correct configuration
-        try:
-            consumer_info = await js.consumer_info(
-                STREAM_NAME, CONSUMER_CONFIG.durable_name
-            )
-            # Check if consumer has deliver_group (bad config from before)
-            if consumer_info.config.deliver_group:
-                logger.warning(
-                    f"Consumer {CONSUMER_CONFIG.durable_name} has deliver_group set, "
-                    "recreating..."
-                )
-                await js.delete_consumer(STREAM_NAME, CONSUMER_CONFIG.durable_name)
-                await js.add_consumer(stream=STREAM_NAME, config=CONSUMER_CONFIG)
-                logger.info(f"Recreated consumer {CONSUMER_CONFIG.durable_name}")
-            else:
-                logger.info(
-                    f"Consumer {CONSUMER_CONFIG.durable_name} exists with correct config"
-                )
-        except Exception as e:
-            # Consumer doesn't exist, create it
-            if "not found" in str(e).lower():
-                await js.add_consumer(stream=STREAM_NAME, config=CONSUMER_CONFIG)
-                logger.info(f"Created consumer {CONSUMER_CONFIG.durable_name}")
-            else:
-                logger.warning(f"Consumer check warning: {e}")
-
-        # Create NATS consumer tasks
-        num_consumers = get_settings().nats__num_of_summarizer_consumer_instances
-        logger.info(f"Creating {num_consumers} NATS consumer instances")
-
-        consumer_tasks = create_job_consumer_async_task(
-            nats_client=contexts.nats_client,
-            jetstream_client=contexts.jetstream_client,
-            consumer_config=CONSUMER_CONFIG,
-            processing_func=process_nats_message,
-            num_of_consumer_instances=num_consumers,
+        # Create producer from the same connection
+        app_state.producer = NatsProducer(
+            app_state.consumer._nats_client,
+            app_state.consumer._jetstream,
+            stream_settings,
         )
-        nats_consumer_job_connection.extend(consumer_tasks)
-        logger.info("Startup completed successfully")
+        logger.info("NATS producer initialized")
 
     except Exception as e:
-        logger.error(f"Error during startup: {e}")
+        logger.error(f"Failed to initialize NATS: {e}")
         raise
 
+    logger.info("Startup complete")
     yield
 
     # Shutdown
     logger.info("Shutting down extraction API")
-    for task in nats_consumer_job_connection:
-        try:
-            await close_nats_connection(task)
-        except Exception as e:
-            logger.error(f"Error closing NATS connection: {e}")
+
+    if app_state.consumer:
+        await app_state.consumer.shutdown()
 
     # Clean up temporary GCP credentials file
     if _temp_credentials_file and os.path.exists(_temp_credentials_file):
         try:
             os.unlink(_temp_credentials_file)
-            logger.debug(f"Cleaned up temporary credentials file: {_temp_credentials_file}")
         except Exception as e:
             logger.warning(f"Failed to remove temporary credentials file: {e}")
 
-    logger.info("Shutdown completed")
+    logger.info("Shutdown complete")
 
 
 app = FastAPI(
     title="Court Decision Extraction API",
-    description="API for extracting structured data from Indonesian Supreme Court decisions",
-    version="2.0.0",
+    description="API for extracting structured data from Indonesian Supreme Court "
+    "decisions",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
 
 # =============================================================================
-# NATS Message Processor
-# =============================================================================
-
-
-async def process_nats_message(msg: Msg) -> None:
-    """Process extraction request from NATS queue."""
-    global CONTEXTS
-    logger.info("Processing NATS message")
-    total_start_time = asyncio.get_event_loop().time()
-    extraction_id = None
-
-    try:
-        contexts = await CONTEXTS.get_app_contexts(init_nats=True)
-        data = json.loads(msg.data.decode())
-        extraction_id = data.get("extraction_id")
-
-        if not extraction_id:
-            logger.error(f"Missing extraction_id in message: {data}")
-            await msg.ack()
-            return
-
-        logger.info(f"Processing extraction: {extraction_id}")
-
-        async_session = async_sessionmaker(
-            bind=contexts.crawler_db_engine, class_=AsyncSession
-        )
-
-        # Check if extraction meets criteria (has artifact_link and valid raw_page_link)
-        async with async_session() as session:
-            result = await session.execute(
-                select(Extraction).where(Extraction.id == extraction_id)
-            )
-            extraction_record = result.scalar_one_or_none()
-
-            if not extraction_record:
-                logger.warning(f"Extraction {extraction_id} not found, skipping")
-                await msg.ack()
-                return
-
-            if not extraction_record.artifact_link:
-                logger.warning(
-                    f"Extraction {extraction_id} has no artifact_link, skipping"
-                )
-                await msg.ack()
-                return
-
-            if not extraction_record.raw_page_link.startswith("https://putusan3"):
-                logger.warning(
-                    f"Extraction {extraction_id} has invalid raw_page_link, skipping"
-                )
-                await msg.ack()
-                return
-
-        # Check if extraction is already completed (idempotency check)
-        async with async_session() as session:
-            result = await session.execute(
-                select(LLMExtraction).where(
-                    LLMExtraction.extraction_id == extraction_id
-                )
-            )
-            existing = result.scalar_one_or_none()
-            if existing and existing.status == ExtractionStatus.COMPLETED.value:
-                logger.info(
-                    f"Extraction {extraction_id} already completed, skipping"
-                )
-                await msg.ack()
-                return
-
-        extract_start = asyncio.get_event_loop().time()
-        extraction_result, summary_id, summary_en, decision_number = (
-            await run_extraction_pipeline(
-                extraction_id=extraction_id,
-                crawler_db_engine=contexts.crawler_db_engine,
-                case_db_engine=contexts.case_db_engine,
-            )
-        )
-        extract_duration = asyncio.get_event_loop().time() - extract_start
-        update_processing_times("extraction", extract_duration)
-
-        logger.info(f"Completed extraction for {decision_number}")
-        logger.info(f"Extracted {len(extraction_result.model_dump(exclude_none=True))} fields")
-        await msg.ack()
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in message: {e}")
-        await msg.ack()
-    except Exception as e:
-        logger.error(f"Failed to process extraction {extraction_id}: {e}")
-        await msg.ack()
-    finally:
-        total_duration = asyncio.get_event_loop().time() - total_start_time
-        logger.info(f"Total processing time: {total_duration:.2f}s")
-        if extraction_id:
-            update_processing_times("total", total_duration)
-
-
-# =============================================================================
-# API Endpoints
+# Health Endpoints
 # =============================================================================
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check(
-    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
 ) -> HealthResponse:
     """Check API health status."""
-    nats_connected = (
-        app_contexts.nats_client is not None
-        and app_contexts.nats_client.is_connected
-    )
+    # Check NATS connection
+    nats_connected = app_state.consumer is not None and app_state.consumer.is_connected
 
     # Check database connection
     db_connected = False
     try:
-        async_session = async_sessionmaker(
-            bind=app_contexts.crawler_db_engine, class_=AsyncSession
-        )
+        async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
         async with async_session() as session:
             await session.execute(select(1))
             db_connected = True
@@ -419,6 +361,11 @@ async def health_check(
         nats_connected=nats_connected,
         database_connected=db_connected,
     )
+
+
+# =============================================================================
+# Extraction Endpoints
+# =============================================================================
 
 
 @app.post(
@@ -434,22 +381,36 @@ async def health_check(
 )
 async def submit_extraction(
     payload: ExtractionRequest,
-    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
+    producer: Annotated[NatsProducer, Depends(get_producer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> JobSubmitResponse:
-    """
-    Submit extraction job to NATS queue for processing.
+    """Submit extraction job to NATS queue for processing."""
+    logger.info(f"Submitting extraction: {payload.extraction_id}")
 
-    Returns immediately with job info. Check status via GET /extractions/{id}/status.
-    """
-    logger.info(f"Submitting async extraction: {payload.extraction_id}")
+    async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
 
-    # Create PENDING entry in database immediately
-    async_session = async_sessionmaker(
-        bind=app_contexts.crawler_db_engine, class_=AsyncSession
-    )
+    # First, validate that the extraction exists in source table
     async with async_session() as session:
-        # Check if already exists
+        result = await session.execute(
+            select(Extraction).where(Extraction.id == payload.extraction_id)
+        )
+        source_extraction = result.scalar_one_or_none()
+
+        if not source_extraction:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND,
+                detail=f"Extraction {payload.extraction_id} not found in source table",
+            )
+
+        if not source_extraction.artifact_link:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=f"Extraction {payload.extraction_id} has no PDF (artifact_link)",
+            )
+
+    # Create PENDING entry in database
+    async with async_session() as session:
         result = await session.execute(
             select(LLMExtraction).where(
                 LLMExtraction.extraction_id == payload.extraction_id
@@ -458,7 +419,6 @@ async def submit_extraction(
         existing = result.scalar_one_or_none()
 
         if not existing:
-            # Create new PENDING record
             llm_extraction = LLMExtraction(
                 extraction_id=payload.extraction_id,
                 status=ExtractionStatus.PENDING.value,
@@ -467,43 +427,33 @@ async def submit_extraction(
             await session.commit()
             logger.info(f"Created PENDING record for: {payload.extraction_id}")
         else:
-            # Reset status to PENDING for re-processing
             existing.status = ExtractionStatus.PENDING.value
             session.add(existing)
             await session.commit()
             logger.info(f"Reset status to PENDING for: {payload.extraction_id}")
 
-    try:
-        nats_client: NATS = app_contexts.nats_client
-        if not nats_client.is_connected:
-            app_contexts = await CONTEXTS.get_app_contexts(init_nats=True)
-            nats_client = app_contexts.nats_client
+    # Publish to NATS
+    result = await producer.publish_extraction(payload.extraction_id)
 
-        js = nats_client.jetstream()
-
-        try:
-            await js.add_stream(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
-        except Exception as e:
-            if "already exists" not in str(e):
-                logger.warning(f"Stream creation warning: {e}")
-
-        json_payload = payload.model_dump_json()
-        await js.publish(SUBJECT, json_payload.encode())
-        logger.info(f"Published to NATS: {payload.extraction_id}")
-
-        estimates = get_time_estimate()
-        return JobSubmitResponse(
-            message="Extraction job queued",
-            extraction_id=payload.extraction_id,
-            estimated_processing_time_seconds=estimates["total"],
-        )
-
-    except Exception as e:
-        logger.error(f"Failed to queue extraction: {e}")
+    if not result.success:
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            detail=f"Failed to queue extraction: {str(e)}",
+            detail=f"Failed to queue extraction: {result.error}",
         )
+
+    estimates = get_time_estimate()
+
+    # Check if this was a duplicate submission
+    message = "Extraction job queued"
+    if result.duplicate:
+        message = "Extraction job already queued (duplicate)"
+        logger.info(f"Duplicate submission for {payload.extraction_id}")
+
+    return JobSubmitResponse(
+        message=message,
+        extraction_id=payload.extraction_id,
+        estimated_processing_time_seconds=estimates["total"],
+    )
 
 
 @app.get(
@@ -514,13 +464,11 @@ async def submit_extraction(
 )
 async def get_extraction(
     extraction_id: str,
-    app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> ExtractionResponse:
     """Get extraction result by extraction_id."""
-    async_session = async_sessionmaker(
-        bind=app_contexts.crawler_db_engine, class_=AsyncSession
-    )
+    async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
 
     async with async_session() as session:
         result = await session.execute(
@@ -554,13 +502,11 @@ async def get_extraction(
 )
 async def get_extraction_status(
     extraction_id: str,
-    app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> ExtractionStatusResponse:
     """Get extraction status by extraction_id."""
-    async_session = async_sessionmaker(
-        bind=app_contexts.crawler_db_engine, class_=AsyncSession
-    )
+    async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
 
     async with async_session() as session:
         result = await session.execute(
@@ -576,7 +522,7 @@ async def get_extraction_status(
         )
 
     messages = {
-        ExtractionStatus.PENDING.value: "Extraction is pending",
+        ExtractionStatus.PENDING.value: "Extraction is queued for processing",
         ExtractionStatus.PROCESSING.value: "Extraction is in progress",
         ExtractionStatus.COMPLETED.value: "Extraction completed successfully",
         ExtractionStatus.FAILED.value: "Extraction failed",
@@ -596,19 +542,16 @@ async def get_extraction_status(
     summary="List extractions",
 )
 async def list_extractions(
-    app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
     _api_key: Annotated[str, Depends(verify_api_key)],
     status: str | None = Query(None, description="Filter by status"),
     limit: int = Query(20, ge=1, le=100, description="Number of results"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
 ) -> ExtractionListResponse:
     """List all extractions with optional filtering."""
-    async_session = async_sessionmaker(
-        bind=app_contexts.crawler_db_engine, class_=AsyncSession
-    )
+    async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
 
     async with async_session() as session:
-        # Build query
         query = select(LLMExtraction)
         if status:
             query = query.where(LLMExtraction.status == status)
@@ -618,7 +561,6 @@ async def list_extractions(
         result = await session.execute(query)
         records = result.scalars().all()
 
-        # Get total count
         count_query = select(func.count()).select_from(LLMExtraction)
         if status:
             count_query = count_query.where(LLMExtraction.status == status)
@@ -649,13 +591,11 @@ async def list_extractions(
 )
 async def delete_extraction(
     extraction_id: str,
-    app_contexts: Annotated[AppContexts, Depends(get_db_only_contexts)],
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict:
     """Delete an extraction record."""
-    async_session = async_sessionmaker(
-        bind=app_contexts.crawler_db_engine, class_=AsyncSession
-    )
+    async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
 
     async with async_session() as session:
         result = await session.execute(
@@ -683,27 +623,19 @@ async def delete_extraction(
 async def get_pending_extraction_ids(
     crawler_db_engine: AsyncEngine, limit: int | None = None
 ) -> list[str]:
-    """
-    Get extraction IDs that don't have LLM extraction results yet.
-
-    Uses a NOT IN subquery to find extractions without corresponding
-    llm_extractions records (with COMPLETED or PROCESSING status).
-    Only includes extractions where:
-    - raw_page_link starts with 'https://putusan3'
-    - artifact_link is not null (PDF must be available)
-    """
+    """Get extraction IDs without completed LLM extraction results."""
     async_session = async_sessionmaker(bind=crawler_db_engine, class_=AsyncSession)
 
     async with async_session() as session:
-        # Subquery for existing LLM extractions with COMPLETED or PROCESSING status
         existing_subquery = select(LLMExtraction.extraction_id).where(
-            LLMExtraction.status.in_([
-                ExtractionStatus.COMPLETED.value,
-                ExtractionStatus.PROCESSING.value,
-            ])
+            LLMExtraction.status.in_(
+                [
+                    ExtractionStatus.COMPLETED.value,
+                    ExtractionStatus.PROCESSING.value,
+                ]
+            )
         )
 
-        # Main query: get extractions not in the existing subquery
         query = select(Extraction.id).where(
             Extraction.raw_page_link.startswith("https://putusan3"),
             Extraction.artifact_link.is_not(None),
@@ -721,23 +653,19 @@ async def get_pending_extraction_ids(
     "/extractions/batch",
     response_model=BatchExtractionResponse,
     tags=["Batch Extractions"],
-    summary="Submit all pending extractions to NATS queue",
+    summary="Submit all pending extractions to queue",
 )
-async def submit_batch_extraction_async(
+async def submit_batch_extraction(
     payload: BatchExtractionRequest,
-    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
+    producer: Annotated[NatsProducer, Depends(get_producer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> BatchExtractionResponse:
-    """
-    Submit all pending extractions to NATS queue for processing.
-
-    Returns immediately with job info. Use /extractions endpoint to check progress.
-    """
+    """Submit all pending extractions to NATS queue for processing."""
     logger.info(f"Submitting batch extraction with limit={payload.limit}")
 
-    # Get pending extraction IDs
     pending_ids = await get_pending_extraction_ids(
-        crawler_db_engine=app_contexts.crawler_db_engine,
+        crawler_db_engine=crawler_db,
         limit=payload.limit,
     )
 
@@ -749,83 +677,49 @@ async def submit_batch_extraction_async(
             estimated_time_seconds=0,
         )
 
-    # Create PENDING records and publish to NATS
-    async_session = async_sessionmaker(
-        bind=app_contexts.crawler_db_engine, class_=AsyncSession
-    )
+    # Create PENDING records in database
+    async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
 
-    nats_client: NATS = app_contexts.nats_client
-    if not nats_client.is_connected:
-        app_contexts = await CONTEXTS.get_app_contexts(init_nats=True)
-        nats_client = app_contexts.nats_client
-
-    js = nats_client.jetstream()
-
-    try:
-        await js.add_stream(name=STREAM_NAME, subjects=[STREAM_SUBJECTS])
-    except Exception as e:
-        if "already exists" not in str(e):
-            logger.warning(f"Stream creation warning: {e}")
-
-    # Use semaphore to limit concurrent operations
-    semaphore = asyncio.Semaphore(payload.concurrency)
-    published_count = 0
-    failed_count = 0
-    lock = asyncio.Lock()
-
-    async def process_extraction(extraction_id: str) -> bool:
-        """Process a single extraction: create/update DB record and publish to NATS."""
-        nonlocal published_count, failed_count
-        async with semaphore:
-            try:
-                # Create or update PENDING record
-                async with async_session() as session:
-                    result = await session.execute(
-                        select(LLMExtraction).where(
-                            LLMExtraction.extraction_id == extraction_id
-                        )
-                    )
-                    existing = result.scalar_one_or_none()
-
-                    if not existing:
-                        llm_extraction = LLMExtraction(
-                            extraction_id=extraction_id,
-                            status=ExtractionStatus.PENDING.value,
-                        )
-                        session.add(llm_extraction)
-                        await session.commit()
-                    else:
-                        # Reset status to PENDING for re-processing
-                        existing.status = ExtractionStatus.PENDING.value
-                        session.add(existing)
-                        await session.commit()
-
-                # Publish to NATS
-                json_payload = ExtractionRequest(
-                    extraction_id=extraction_id
-                ).model_dump_json()
-                ack = await js.publish(SUBJECT, json_payload.encode())
-                logger.debug(
-                    f"Published {extraction_id} to stream={ack.stream}, seq={ack.seq}"
+    async def create_pending_record(extraction_id: str) -> None:
+        async with async_session() as session:
+            result = await session.execute(
+                select(LLMExtraction).where(
+                    LLMExtraction.extraction_id == extraction_id
                 )
+            )
+            existing = result.scalar_one_or_none()
 
-                async with lock:
-                    published_count += 1
-                return True
+            if not existing:
+                llm_extraction = LLMExtraction(
+                    extraction_id=extraction_id,
+                    status=ExtractionStatus.PENDING.value,
+                )
+                session.add(llm_extraction)
+            else:
+                existing.status = ExtractionStatus.PENDING.value
+                session.add(existing)
+            await session.commit()
 
-            except Exception as e:
-                logger.error(f"Failed to queue {extraction_id}: {e}")
-                async with lock:
-                    failed_count += 1
-                return False
+    # Create pending records with limited concurrency
+    semaphore = asyncio.Semaphore(payload.concurrency)
 
-    # Process all extractions concurrently
-    await asyncio.gather(*[process_extraction(eid) for eid in pending_ids])
+    async def create_with_semaphore(extraction_id: str) -> None:
+        async with semaphore:
+            await create_pending_record(extraction_id)
 
-    logger.info(
-        f"Published {published_count}/{len(pending_ids)} extractions to NATS "
-        f"(failed: {failed_count})"
+    await asyncio.gather(
+        *[create_with_semaphore(eid) for eid in pending_ids],
+        return_exceptions=True,
     )
+
+    # Publish to NATS
+    results = await producer.publish_batch(
+        pending_ids, max_concurrent=payload.concurrency
+    )
+
+    published_count = sum(1 for r in results.values() if r.success)
+
+    logger.info(f"Published {published_count}/{len(pending_ids)} extractions to NATS")
 
     estimates = get_time_estimate()
     estimated_time = len(pending_ids) * estimates["total"]
@@ -844,55 +738,20 @@ async def submit_batch_extraction_async(
     summary="Get count of pending extractions",
 )
 async def get_pending_count(
-    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
     _api_key: Annotated[str, Depends(verify_api_key)],
 ) -> dict:
     """Get the number of extractions pending LLM processing."""
-    pending_ids = await get_pending_extraction_ids(
-        crawler_db_engine=app_contexts.crawler_db_engine,
-    )
+    pending_ids = await get_pending_extraction_ids(crawler_db_engine=crawler_db)
     return {
         "pending_count": len(pending_ids),
         "message": f"{len(pending_ids)} extractions pending LLM processing",
     }
 
 
-@app.post(
-    "/nats/test-publish",
-    tags=["Diagnostics"],
-    summary="Test publishing a single message to NATS",
-)
-async def test_nats_publish(
-    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
-    _api_key: Annotated[str, Depends(verify_api_key)],
-) -> dict:
-    """Test publishing a single message and verify it's stored."""
-    js = app_contexts.nats_client.jetstream()
-
-    test_payload = {"extraction_id": "test-message-123", "test": True}
-
-    try:
-        ack = await js.publish(
-            SUBJECT,
-            json.dumps(test_payload).encode(),
-        )
-        return {
-            "success": True,
-            "ack": {
-                "stream": ack.stream,
-                "seq": ack.seq,
-                "duplicate": ack.duplicate if hasattr(ack, "duplicate") else None,
-            },
-            "subject": SUBJECT,
-            "payload": test_payload,
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "subject": SUBJECT,
-        }
+# =============================================================================
+# Diagnostics Endpoints
+# =============================================================================
 
 
 @app.get(
@@ -901,118 +760,65 @@ async def test_nats_publish(
     summary="Get NATS stream and consumer diagnostics",
 )
 async def get_nats_diagnostics(
-    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    consumer: Annotated[NatsConsumer, Depends(get_consumer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
-) -> dict:
+) -> dict[str, Any]:
     """Get NATS stream and consumer state for debugging."""
-    js = app_contexts.nats_client.jetstream()
-
-    try:
-        # Get stream info
-        stream_info = await js.stream_info(STREAM_NAME)
-        stream_state = {
-            "name": stream_info.config.name,
-            "subjects": stream_info.config.subjects,
-            "messages": stream_info.state.messages,
-            "bytes": stream_info.state.bytes,
-            "consumer_count": stream_info.state.consumer_count,
-            "first_seq": stream_info.state.first_seq,
-            "last_seq": stream_info.state.last_seq,
-        }
-    except Exception as e:
-        stream_state = {"error": str(e)}
-
-    try:
-        # Get consumer info
-        consumer_info = await js.consumer_info(STREAM_NAME, CONSUMER_CONFIG.durable_name)
-        consumer_state = {
-            "name": consumer_info.name,
-            "durable_name": consumer_info.config.durable_name,
-            "filter_subject": consumer_info.config.filter_subject,
-            "num_pending": consumer_info.num_pending,
-            "num_waiting": consumer_info.num_waiting,
-            "num_ack_pending": consumer_info.num_ack_pending,
-            "num_redelivered": consumer_info.num_redelivered,
-            "delivered_consumer_seq": consumer_info.delivered.consumer_seq,
-            "delivered_stream_seq": consumer_info.delivered.stream_seq,
-        }
-    except Exception as e:
-        consumer_state = {"error": str(e)}
-
-    return {
-        "stream": stream_state,
-        "consumer": consumer_state,
-        "config": {
-            "stream_name": STREAM_NAME,
-            "stream_subjects": STREAM_SUBJECTS,
-            "publish_subject": SUBJECT,
-        },
-    }
+    return await consumer.get_queue_stats()
 
 
 @app.post(
     "/nats/consumer/reset",
     tags=["Diagnostics"],
-    summary="Reset stuck consumer by deleting and recreating it",
+    summary="Reset stuck consumer",
 )
 async def reset_nats_consumer(
-    app_contexts: Annotated[AppContexts, Depends(get_full_contexts)],
+    consumer: Annotated[NatsConsumer, Depends(get_consumer)],
     _api_key: Annotated[str, Depends(verify_api_key)],
-) -> dict:
+) -> dict[str, Any]:
     """
     Reset the NATS consumer by deleting and recreating it.
 
-    Use this when messages are stuck in "ack_pending" state from crashed consumers.
-    This will cause all in-flight messages to be redelivered immediately.
-
-    WARNING: This will reset consumer state. Any messages currently being processed
-    may be delivered again (at-least-once delivery).
+    Use when messages are stuck in "ack_pending" state from crashed consumers.
     """
-    js = app_contexts.nats_client.jetstream()
+    return await consumer.reset_consumer()
 
-    try:
-        # Get current consumer state for logging
-        try:
-            consumer_info = await js.consumer_info(
-                STREAM_NAME, CONSUMER_CONFIG.durable_name
-            )
-            old_state = {
-                "num_pending": consumer_info.num_pending,
-                "num_ack_pending": consumer_info.num_ack_pending,
-                "num_redelivered": consumer_info.num_redelivered,
-            }
-        except Exception:
-            old_state = {"error": "Could not get consumer state"}
 
-        # Delete the consumer
-        await js.delete_consumer(STREAM_NAME, CONSUMER_CONFIG.durable_name)
-        logger.info(f"Deleted consumer {CONSUMER_CONFIG.durable_name}")
+@app.post(
+    "/nats/test-publish",
+    tags=["Diagnostics"],
+    summary="Test publishing a message",
+)
+async def test_nats_publish(
+    producer: Annotated[NatsProducer, Depends(get_producer)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict[str, Any]:
+    """Test publishing a single message and verify it's stored."""
+    result = await producer.publish(
+        subject=QueueSubject.EXTRACTION.value,
+        payload={"extraction_id": "test-message-123", "test": True},
+    )
 
-        # Recreate the consumer
-        await js.add_consumer(stream=STREAM_NAME, config=CONSUMER_CONFIG)
-        logger.info(f"Recreated consumer {CONSUMER_CONFIG.durable_name}")
+    return {
+        "success": result.success,
+        "stream": result.stream,
+        "sequence": result.sequence,
+        "duplicate": result.duplicate,
+        "error": result.error,
+    }
 
-        # Get new consumer state
-        consumer_info = await js.consumer_info(
-            STREAM_NAME, CONSUMER_CONFIG.durable_name
-        )
-        new_state = {
-            "num_pending": consumer_info.num_pending,
-            "num_ack_pending": consumer_info.num_ack_pending,
-            "num_redelivered": consumer_info.num_redelivered,
-        }
 
-        return {
-            "success": True,
-            "message": "Consumer reset successfully. Workers will reconnect automatically.",
-            "old_state": old_state,
-            "new_state": new_state,
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to reset consumer: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__,
-        }
+@app.get(
+    "/metrics",
+    tags=["Diagnostics"],
+    summary="Get processing metrics",
+)
+async def get_metrics(
+    consumer: Annotated[NatsConsumer, Depends(get_consumer)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict[str, Any]:
+    """Get consumer processing metrics."""
+    return {
+        "consumer_metrics": consumer.metrics.to_dict(),
+        "time_estimates": get_time_estimate(),
+    }

@@ -9,9 +9,9 @@ This module orchestrates the complete extraction workflow:
 """
 
 import logging
+
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from src.io import get_extraction_db_data_and_validate, read_pdf_from_uri
 from src.extraction import (
     ExtractionResult,
     ExtractionStatus,
@@ -19,6 +19,7 @@ from src.extraction import (
     save_llm_extraction,
     update_llm_extraction_status,
 )
+from src.io import get_extraction_db_data_and_validate, read_pdf_from_uri
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,6 @@ logger = logging.getLogger(__name__)
 async def run_extraction_pipeline(
     extraction_id: str,
     crawler_db_engine: AsyncEngine,
-    case_db_engine: AsyncEngine,
 ) -> tuple[ExtractionResult, str, str, str]:
     """
     Run the complete extraction pipeline for a court decision document.
@@ -41,7 +41,6 @@ async def run_extraction_pipeline(
     Args:
         extraction_id: The ID of the extraction record
         crawler_db_engine: Database engine for crawler schema
-        case_db_engine: Database engine for case schema
 
     Returns:
         Tuple of (ExtractionResult, summary_id, summary_en, decision_number)
@@ -55,12 +54,10 @@ async def run_extraction_pipeline(
     try:
         # Step 1: Validate and fetch extraction data
         logger.info(f"Step 1: Validating extraction data for {extraction_id}")
-        crawler_meta, case_meta = await get_extraction_db_data_and_validate(
+        crawler_meta, decision_number = await get_extraction_db_data_and_validate(
             extraction_id=extraction_id,
             crawler_db_engine=crawler_db_engine,
-            case_db_engine=case_db_engine,
         )
-        decision_number = case_meta.decision_number
         logger.info(f"Validated extraction for decision number: {decision_number}")
 
         # Step 2: Download and extract text from PDF
@@ -80,7 +77,7 @@ async def run_extraction_pipeline(
             logger.warning(f"Could not update status to processing: {status_error}")
 
         # Step 3: Process through LLM extraction pipeline
-        logger.info(f"Step 3: Processing document through LLM extraction pipeline")
+        logger.info("Step 3: Processing document through LLM extraction pipeline")
         extraction_result, summary_id, summary_en = await process_document_extraction(
             decision_number=decision_number,
             doc_content=doc_content,
@@ -88,7 +85,7 @@ async def run_extraction_pipeline(
         logger.info(f"LLM extraction completed for {decision_number}")
 
         # Step 4: Save to database
-        logger.info(f"Step 4: Saving extraction result to database")
+        logger.info("Step 4: Saving extraction result to database")
         await save_llm_extraction(
             db_engine=crawler_db_engine,
             extraction_id=extraction_id,

@@ -36,8 +36,8 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 # LLM Model configuration
-MODEL = "gemini/gemini-2.5-flash-lite"
-CHUNK_SIZE = 100  # Number of pages per chunk
+MODEL = "gemini/gemini-2.5-flash"
+CHUNK_SIZE = 50  # Number of pages per chunk
 
 
 # =============================================================================
@@ -1263,9 +1263,20 @@ async def extract_from_chunk(
         model=MODEL,
         messages=messages,
         response_format={"type": "json_object"},
+        max_tokens=16384,
     )
 
     raw_content = response.choices[0].message.content
+    finish_reason = response.choices[0].finish_reason
+
+    # Check if response was truncated due to token limit
+    if finish_reason == "length":
+        logger.warning(
+            f"Chunk {chunk_number}: Response truncated due to max_tokens limit. "
+            "Retrying..."
+        )
+        raise ValueError("LLM response truncated due to token limit")
+
     logger.debug(f"Raw LLM response for chunk {chunk_number}: {raw_content[:500]}...")
 
     # Clean up response - remove markdown code blocks if present

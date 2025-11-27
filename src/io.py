@@ -1,9 +1,8 @@
 import asyncio
-import tempfile
 import logging
-import re
 import os
-import io
+import re
+import tempfile
 from urllib.parse import urlparse
 
 import aiofiles
@@ -22,11 +21,10 @@ from unstructured.partition.pdf import partition_pdf
 
 # Add pdfminer.six imports
 try:
-    from pdfminer.high_level import extract_pages
-    from pdfminer.layout import LTTextContainer
     from io import StringIO
-    from pdfminer.high_level import extract_text_to_fp
-    from pdfminer.layout import LAParams
+
+    from pdfminer.high_level import extract_pages, extract_text_to_fp
+    from pdfminer.layout import LAParams, LTTextContainer
     HAS_PDFMINER = True
 except ImportError:
     HAS_PDFMINER = False
@@ -51,8 +49,8 @@ from settings import get_settings
 
 # Add imports for Google Cloud Storage, if available
 try:
-    from google.cloud import storage
     from google.auth.exceptions import DefaultCredentialsError
+    from google.cloud import storage
     HAS_GCS = True
 except ImportError:
     HAS_GCS = False
@@ -68,15 +66,6 @@ class Extraction(SQLModel, table=True):
     )  # somehow this converted to dict already
 
 
-class Cases(SQLModel, table=True):
-    id: str = Field(primary_key=True)
-    decision_number: str
-    summary: str | None
-    summary_en: str | None
-    summary_formatted: str | None
-    summary_formatted_en: str | None
-
-
 @retry(
     wait=wait_exponential(multiplier=1, min=2, max=10),
     stop=stop_after_attempt(5),
@@ -84,13 +73,21 @@ class Cases(SQLModel, table=True):
     retry=retry_if_not_exception_type((ValueError, NotImplementedError)),
 )
 async def get_extraction_db_data_and_validate(
-    extraction_id: str, crawler_db_engine: AsyncEngine, case_db_engine: AsyncEngine
-) -> tuple[Extraction, Cases]:
+    extraction_id: str, crawler_db_engine: AsyncEngine
+) -> tuple[Extraction, str]:
+    """
+    Get extraction data and validate it.
+
+    Returns:
+        tuple[Extraction, str]: Extraction record and decision_number
+    """
     logging.info(f"Validating extraction data for ID: {extraction_id}")
     try:
         # Query crawler database
         logging.debug(f"Querying crawler database for extraction ID: {extraction_id}")
-        async_crawler_db_session = async_sessionmaker(bind=crawler_db_engine, class_=AsyncSession)
+        async_crawler_db_session = async_sessionmaker(
+            bind=crawler_db_engine, class_=AsyncSession
+        )
         async with async_crawler_db_session() as session:
             result_iterator = await session.execute(
                 select(Extraction).where(Extraction.id == extraction_id)
@@ -109,7 +106,7 @@ async def get_extraction_db_data_and_validate(
             logging.error(f"Unsupported document source: {crawler_meta.raw_page_link}")
             raise NotImplementedError("only support supreme court document")
 
-        # Validate case number
+        # Get decision number from metadata
         decision_number = crawler_meta.metadata_.get("number", None)
         if decision_number is None:
             logging.error(f"Case number not found in metadata: {crawler_meta.metadata_}")
@@ -117,30 +114,17 @@ async def get_extraction_db_data_and_validate(
                 "case number identifier not found in `extraction` table : "
                 f"{crawler_meta.metadata_}"
             )
-        logging.debug(f"Found decision number: {decision_number}")
-
-        # Query case database
-        logging.debug(f"Querying case database for decision number: {decision_number}")
-        async_case_db_session = async_sessionmaker(bind=case_db_engine, class_=AsyncSession)
-        async with async_case_db_session() as session:
-            result_iterator = await session.execute(
-                select(Cases).where(Cases.decision_number == decision_number)
-            )
-
-        case_meta = [result for result in result_iterator]
-        if not case_meta:
-            logging.error(f"Decision number {decision_number} not found in cases database")
-            raise ValueError(
-                "case number identifier not found in `cases` table : "
-                f"{crawler_meta.metadata_}"
-            )
-        logging.info(f"Successfully validated extraction data for {extraction_id} with decision number {decision_number}")
-        return crawler_meta, case_meta[0][0]
+        logging.info(
+            f"Successfully validated extraction data for {extraction_id} "
+            f"with decision number {decision_number}"
+        )
+        return crawler_meta, decision_number
     except Exception as e:
         if isinstance(e, (ValueError, NotImplementedError)):
-            # Let these exceptions propagate as is since they're already handled
             raise
-        logging.error(f"Error in get_extraction_db_data_and_validate for {extraction_id}: {str(e)}")
+        logging.error(
+            f"Error in get_extraction_db_data_and_validate for {extraction_id}: {e}"
+        )
         raise
 
 
@@ -349,7 +333,6 @@ def remove_watermark(text):
     Returns:
         The text with watermarks removed
     """
-    import re
 
     # Remove diagonal watermark patterns (Mahkamah Agung Republik Indonesia)
     # This handles various ways the watermark might appear in extracted text
@@ -397,8 +380,8 @@ async def extract_text_with_pdfminer(pdf_path: str) -> dict[int, str]:
         # Method 1: Use page-by-page extraction with extract_text
         try:
             from pdfminer.high_level import extract_text
-            from pdfminer.pdfparser import PDFParser
             from pdfminer.pdfdocument import PDFDocument
+            from pdfminer.pdfparser import PDFParser
 
             # First get total pages
             with open(pdf_path, 'rb') as file:
@@ -471,7 +454,7 @@ async def extract_text_with_pdfminer(pdf_path: str) -> dict[int, str]:
                 text = clean_text(text)
                 text = remove_watermark(text)
                 contents[1] = text
-                logging.info(f"Successfully extracted text using pdfminer.six extract_text_to_fp method")
+                logging.info("Successfully extracted text using pdfminer.six extract_text_to_fp method")
                 return contents
             else:
                 raise ValueError("No text extracted from PDF with any pdfminer.six method")
