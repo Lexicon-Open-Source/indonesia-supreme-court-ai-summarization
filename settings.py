@@ -33,7 +33,8 @@ class Settings(BaseSettings):
 
     # LLM extraction settings
     extraction_chunk_size: int = 50  # Number of pages per LLM chunk
-    extraction_model: str = "gemini/gemini-2.5-flash"  # LiteLLM model identifier
+    extraction_model: str = "gemini/gemini-2.5-flash-lite"  # Primary model (fast/cheap)
+    extraction_fallback_model: str | None = "gemini/gemini-2.5-flash"  # Fallback for truncation/errors
 
     # Optional: Google Cloud Storage settings
     gcp_project_id: str | None = None

@@ -9,6 +9,7 @@ This module handles:
 5. Database persistence to llm_extractions table
 """
 
+import asyncio
 import json
 import logging
 import traceback
@@ -1220,11 +1221,132 @@ def chunk_document(doc_content: dict[int, str], chunk_size: int) -> list[str]:
     return chunks
 
 
-@retry(
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    stop=stop_after_attempt(5),
-    reraise=True,
-)
+class TruncationError(Exception):
+    """Raised when LLM response is truncated due to token limit."""
+    pass
+
+
+def _sanitize_json_control_chars(s: str) -> str:
+    """
+    Escape control characters inside JSON string values.
+    Control chars (0x00-0x1F) must be escaped when inside JSON strings.
+    """
+    chars = []
+    in_string = False
+    i = 0
+    while i < len(s):
+        char = s[i]
+
+        if not in_string:
+            # Outside string - just copy characters
+            if char == '"':
+                in_string = True
+            chars.append(char)
+            i += 1
+        else:
+            # Inside string
+            if char == "\\" and i + 1 < len(s):
+                # Escape sequence - copy both chars
+                chars.append(s[i : i + 2])
+                i += 2
+            elif char == '"':
+                # End of string
+                in_string = False
+                chars.append(char)
+                i += 1
+            elif ord(char) < 32:
+                # Control character - escape it
+                if char == "\n":
+                    chars.append("\\n")
+                elif char == "\r":
+                    chars.append("\\r")
+                elif char == "\t":
+                    chars.append("\\t")
+                else:
+                    chars.append(f"\\u{ord(char):04x}")
+                i += 1
+            else:
+                chars.append(char)
+                i += 1
+
+    return "".join(chars)
+
+
+async def _call_extraction_llm(
+    messages: list[dict],
+    model: str,
+    chunk_number: int,
+) -> ExtractionResult:
+    """
+    Call LLM for extraction and parse the response.
+
+    Args:
+        messages: The messages to send to the LLM
+        model: The model identifier to use
+        chunk_number: Current chunk number for logging
+
+    Returns:
+        ExtractionResult parsed from LLM response
+
+    Raises:
+        TruncationError: If response was truncated due to token limit
+        json.JSONDecodeError: If response is not valid JSON
+        Exception: If response fails validation
+    """
+    logger.info(f"Chunk {chunk_number}: Calling model {model}")
+
+    response = await acompletion(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+    )
+
+    raw_content = response.choices[0].message.content
+    finish_reason = response.choices[0].finish_reason
+
+    # Check if response was truncated due to token limit
+    if finish_reason == "length":
+        raise TruncationError(
+            f"Chunk {chunk_number}: Response truncated due to max_tokens limit"
+        )
+
+    logger.debug(f"Raw LLM response for chunk {chunk_number}: {raw_content[:500]}...")
+
+    # Clean up response - remove markdown code blocks if present
+    cleaned_content = raw_content.strip()
+    if cleaned_content.startswith("```json"):
+        cleaned_content = cleaned_content[7:]
+    elif cleaned_content.startswith("```"):
+        cleaned_content = cleaned_content[3:]
+    if cleaned_content.endswith("```"):
+        cleaned_content = cleaned_content[:-3]
+    cleaned_content = cleaned_content.strip()
+
+    # Sanitize control characters
+    cleaned_content = _sanitize_json_control_chars(cleaned_content)
+
+    # Parse JSON
+    parsed_json = json.loads(cleaned_content)
+
+    # Validate and create result
+    result = ExtractionResult(**parsed_json)
+
+    # Check if result is mostly empty
+    non_null_fields = sum(1 for v in result.model_dump().values() if v is not None)
+    logger.info(
+        f"Chunk {chunk_number}: extracted {non_null_fields} non-null fields "
+        f"using {model}"
+    )
+
+    if non_null_fields <= 1:  # Only extraction_confidence or nothing
+        logger.warning(
+            f"Chunk {chunk_number} extraction mostly empty. "
+            f"Raw response preview: {raw_content[:200]}"
+        )
+
+    return result
+
+
 async def extract_from_chunk(
     chunk_content: str,
     current_extraction: dict[str, Any],
@@ -1233,6 +1355,8 @@ async def extract_from_chunk(
 ) -> ExtractionResult:
     """
     Extract information from a single document chunk using LLM.
+
+    Tries the primary model first, falls back to larger model on truncation/error.
 
     Args:
         chunk_content: Text content of the chunk
@@ -1259,115 +1383,67 @@ async def extract_from_chunk(
     ]
 
     settings = get_settings()
-    response = await acompletion(
-        model=settings.extraction_model,
-        messages=messages,
-        response_format={"type": "json_object"},
+    primary_model = settings.extraction_model
+    fallback_model = settings.extraction_fallback_model
+
+    # Try primary model first
+    last_error = None
+    for attempt in range(3):  # 3 attempts with primary model
+        try:
+            return await _call_extraction_llm(messages, primary_model, chunk_number)
+        except TruncationError as e:
+            logger.warning(f"Chunk {chunk_number}: {e} (attempt {attempt + 1}/3)")
+            last_error = e
+            # Don't retry truncation with same model, go to fallback
+            break
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"Chunk {chunk_number}: JSON parse error with {primary_model} "
+                f"(attempt {attempt + 1}/3): {e}"
+            )
+            last_error = e
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        except Exception as e:
+            logger.warning(
+                f"Chunk {chunk_number}: Error with {primary_model} "
+                f"(attempt {attempt + 1}/3): {e}"
+            )
+            last_error = e
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+
+    # Try fallback model if available and different from primary
+    if fallback_model and fallback_model != primary_model:
+        logger.info(
+            f"Chunk {chunk_number}: Primary model failed, falling back to {fallback_model}"
+        )
+        for attempt in range(3):  # 3 attempts with fallback model
+            try:
+                result = await _call_extraction_llm(messages, fallback_model, chunk_number)
+                logger.info(
+                    f"Chunk {chunk_number}: Fallback model {fallback_model} succeeded"
+                )
+                return result
+            except TruncationError as e:
+                logger.error(
+                    f"Chunk {chunk_number}: Fallback model also truncated: {e}"
+                )
+                last_error = e
+                break  # Don't retry truncation
+            except Exception as e:
+                logger.warning(
+                    f"Chunk {chunk_number}: Fallback error (attempt {attempt + 1}/3): {e}"
+                )
+                last_error = e
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+
+    # Both models failed
+    logger.error(
+        f"Chunk {chunk_number}: All extraction attempts failed. Last error: {last_error}"
     )
-
-    raw_content = response.choices[0].message.content
-    finish_reason = response.choices[0].finish_reason
-
-    # Check if response was truncated due to token limit
-    if finish_reason == "length":
-        logger.warning(
-            f"Chunk {chunk_number}: Response truncated due to max_tokens limit. "
-            "Retrying..."
-        )
-        raise ValueError("LLM response truncated due to token limit")
-
-    logger.debug(f"Raw LLM response for chunk {chunk_number}: {raw_content[:500]}...")
-
-    # Clean up response - remove markdown code blocks if present
-    cleaned_content = raw_content.strip()
-    if cleaned_content.startswith("```json"):
-        cleaned_content = cleaned_content[7:]
-    elif cleaned_content.startswith("```"):
-        cleaned_content = cleaned_content[3:]
-    if cleaned_content.endswith("```"):
-        cleaned_content = cleaned_content[:-3]
-    cleaned_content = cleaned_content.strip()
-
-    # Sanitize control characters inside JSON strings
-    # This fixes LLM responses that contain unescaped newlines/tabs in strings
-    def sanitize_json_control_chars(s: str) -> str:
-        """
-        Escape control characters inside JSON string values.
-        Control chars (0x00-0x1F) must be escaped when inside JSON strings.
-        """
-        chars = []
-        in_string = False
-        i = 0
-        while i < len(s):
-            char = s[i]
-
-            if not in_string:
-                # Outside string - just copy characters
-                if char == '"':
-                    in_string = True
-                chars.append(char)
-                i += 1
-            else:
-                # Inside string
-                if char == "\\" and i + 1 < len(s):
-                    # Escape sequence - copy both chars
-                    chars.append(s[i : i + 2])
-                    i += 2
-                elif char == '"':
-                    # End of string
-                    in_string = False
-                    chars.append(char)
-                    i += 1
-                elif ord(char) < 32:
-                    # Control character - escape it
-                    if char == "\n":
-                        chars.append("\\n")
-                    elif char == "\r":
-                        chars.append("\\r")
-                    elif char == "\t":
-                        chars.append("\\t")
-                    else:
-                        chars.append(f"\\u{ord(char):04x}")
-                    i += 1
-                else:
-                    chars.append(char)
-                    i += 1
-
-        return "".join(chars)
-
-    cleaned_content = sanitize_json_control_chars(cleaned_content)
-
-    parsed_json = None
-    try:
-        parsed_json = json.loads(cleaned_content)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON from chunk {chunk_number}: {e}")
-        logger.error(f"Cleaned content: {cleaned_content[:500]}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise
-
-    try:
-        result = ExtractionResult(**parsed_json)
-    except Exception as e:
-        logger.error(f"Failed to validate extraction from chunk {chunk_number}: {e}")
-        logger.error(
-            f"Parsed JSON keys: {list(parsed_json.keys()) if parsed_json else 'N/A'}"
-        )
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise
-
-    # Check if result is mostly empty
-    non_null_fields = sum(1 for v in result.model_dump().values() if v is not None)
-    logger.info(f"Chunk {chunk_number}: extracted {non_null_fields} non-null fields")
-
-    if non_null_fields <= 1:  # Only extraction_confidence or nothing
-        logger.warning(
-            f"Chunk {chunk_number} extraction mostly empty. "
-            f"Raw response preview: {raw_content[:200]}"
-        )
-
-    logger.debug(f"Successfully extracted from chunk {chunk_number}")
-    return result
+    raise last_error or ValueError(f"Extraction failed for chunk {chunk_number}")
 
 
 @retry(
