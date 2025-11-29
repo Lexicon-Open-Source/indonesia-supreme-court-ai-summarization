@@ -21,20 +21,21 @@ from typing import Any
 import litellm
 from litellm import acompletion
 from pydantic import BaseModel, Field
-
-# Enable JSON schema validation for structured output
-litellm.enable_json_schema_validation = True
-# Uncomment for verbose debugging:
-# litellm.set_verbose = True
 from sqlalchemy import TIMESTAMP
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
-from sqlmodel import Column, Field as SQLField, SQLModel, select
+from sqlmodel import Column, SQLModel, select
+from sqlmodel import Field as SQLField
 from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
 from settings import get_settings
+
+# Enable JSON schema validation for structured output
+litellm.enable_json_schema_validation = True
+# Uncomment for verbose debugging:
+# litellm.set_verbose = True
 
 logger = logging.getLogger(__name__)
 
@@ -1325,7 +1326,7 @@ def chunk_document(doc_content: dict[int, str], chunk_size: int) -> list[str]:
     current_chunk = []
     current_chunk_pages = 0
 
-    for page_num, content in sorted_pages:
+    for _, content in sorted_pages:
         current_chunk.append(content)
         current_chunk_pages += 1
 
