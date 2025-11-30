@@ -796,6 +796,244 @@ class AdditionalCaseData(BaseModel):
 
 
 # =============================================================================
+# Nested Models - Defense Strategy
+# =============================================================================
+
+
+class ExceptionArgument(BaseModel):
+    """Exception argument type and details."""
+
+    type: str | None = Field(
+        default=None,
+        description="Jenis argumen eksepsi (competence/indictment_validity/procedure)",
+    )
+    description: str | None = Field(
+        default=None, description="Deskripsi argumen eksepsi"
+    )
+    details: str | None = Field(
+        default=None, description="Detail argumen eksepsi"
+    )
+
+
+class ProsecutorExceptionResponse(BaseModel):
+    """Prosecutor's response to exception."""
+
+    date: str | None = Field(
+        default=None, description="Tanggal tanggapan JPU (Format: YYYY-MM-DD)"
+    )
+    summary: str | None = Field(
+        default=None, description="Ringkasan tanggapan Penuntut Umum atas Eksepsi"
+    )
+
+
+class InterlocutoryRuling(BaseModel):
+    """Court's interlocutory ruling on exception."""
+
+    date: str | None = Field(
+        default=None, description="Tanggal putusan sela (Format: YYYY-MM-DD)"
+    )
+    decision: str | None = Field(
+        default=None, description="Keputusan putusan sela (Diterima/Ditolak)"
+    )
+    reasoning: str | None = Field(
+        default=None, description="Alasan/pertimbangan putusan sela"
+    )
+
+
+class DefenseException(BaseModel):
+    """Defense exception (eksepsi) information."""
+
+    filed: bool | None = Field(
+        default=None, description="Apakah eksepsi diajukan"
+    )
+    date: str | None = Field(
+        default=None, description="Tanggal pengajuan eksepsi (Format: YYYY-MM-DD)"
+    )
+    summary: str | None = Field(
+        default=None, description="Ringkasan eksepsi yang diajukan"
+    )
+    primary_arguments: list[ExceptionArgument] | None = Field(
+        default=None, description="Argumen utama dalam eksepsi"
+    )
+    prosecutor_response: ProsecutorExceptionResponse | None = Field(
+        default=None, description="Tanggapan Penuntut Umum atas eksepsi"
+    )
+    court_interlocutory_ruling: InterlocutoryRuling | None = Field(
+        default=None, description="Putusan sela pengadilan atas eksepsi"
+    )
+
+
+class PersonalPlea(BaseModel):
+    """Personal plea from defendant."""
+
+    filed: bool | None = Field(
+        default=None, description="Apakah pembelaan pribadi diajukan"
+    )
+    summary: str | None = Field(
+        default=None,
+        description="Ringkasan pembelaan pribadi terdakwa (biasanya memohon keringanan)",
+    )
+
+
+class PleaArgument(BaseModel):
+    """Key argument in legal counsel's plea."""
+
+    point: str | None = Field(
+        default=None,
+        description="Poin argumen (unsur_melawan_hukum/unsur_memperkaya_diri/procedural_flaws)",
+    )
+    argument: str | None = Field(
+        default=None, description="Isi argumen"
+    )
+
+
+class LegalCounselPlea(BaseModel):
+    """Legal counsel's plea (pledoi)."""
+
+    filed: bool | None = Field(
+        default=None, description="Apakah pledoi pengacara diajukan"
+    )
+    summary: str | None = Field(
+        default=None, description="Ringkasan pembelaan yuridis dari pengacara"
+    )
+    key_arguments: list[PleaArgument] | None = Field(
+        default=None, description="Argumen utama dalam pledoi"
+    )
+    specific_requests: list[str] | None = Field(
+        default=None,
+        description="Permintaan spesifik (Vrijspraak/Onslag/Keringanan/Pengembalian aset)",
+    )
+
+
+class DefensePlea(BaseModel):
+    """Defense plea (pledoi) information."""
+
+    date: str | None = Field(
+        default=None, description="Tanggal pengajuan pledoi (Format: YYYY-MM-DD)"
+    )
+    submitted_by: list[str] | None = Field(
+        default=None, description="Pihak yang mengajukan pledoi"
+    )
+    personal_plea: PersonalPlea | None = Field(
+        default=None, description="Pembelaan pribadi dari terdakwa"
+    )
+    legal_counsel_plea: LegalCounselPlea | None = Field(
+        default=None, description="Pembelaan yuridis dari pengacara"
+    )
+
+
+class Replik(BaseModel):
+    """Prosecutor's response to plea (replik)."""
+
+    date: str | None = Field(
+        default=None, description="Tanggal replik (Format: YYYY-MM-DD)"
+    )
+    summary: str | None = Field(
+        default=None, description="Ringkasan tanggapan Jaksa atas Pledoi"
+    )
+
+
+class Duplik(BaseModel):
+    """Defense response to replik (duplik)."""
+
+    date: str | None = Field(
+        default=None, description="Tanggal duplik (Format: YYYY-MM-DD)"
+    )
+    summary: str | None = Field(
+        default=None, description="Ringkasan tanggapan balik Pengacara atas Replik"
+    )
+
+
+class Rejoinders(BaseModel):
+    """Rejoinder information (replik and duplik)."""
+
+    replik: Replik | None = Field(
+        default=None, description="Tanggapan Jaksa atas Pledoi"
+    )
+    duplik: Duplik | None = Field(
+        default=None, description="Tanggapan balik Pengacara atas Replik"
+    )
+
+
+class DefenseStrategy(BaseModel):
+    """Complete defense strategy information."""
+
+    exception: DefenseException | None = Field(
+        default=None, description="Informasi eksepsi yang diajukan"
+    )
+    plea: DefensePlea | None = Field(
+        default=None, description="Informasi pledoi/pembelaan"
+    )
+    rejoinders: Rejoinders | None = Field(
+        default=None, description="Informasi replik dan duplik"
+    )
+
+
+# =============================================================================
+# Nested Models - Legal Entity Analysis
+# =============================================================================
+
+
+class EntityRegistryItem(BaseModel):
+    """Individual legal entity involved in the case."""
+
+    id: str | None = Field(
+        default=None, description="Unique identifier for the entity (e.g., ENT_01)"
+    )
+    name: str | None = Field(
+        default=None, description="Nama entitas/badan hukum"
+    )
+    legal_form: str | None = Field(
+        default=None,
+        description="Bentuk hukum (Instansi Pemerintah/PT/CV/Yayasan/dll)",
+    )
+    sector: str | None = Field(
+        default=None,
+        description="Sektor entitas (Pendidikan/Swasta/Pengawasan/dll)",
+    )
+    role_in_case: str | None = Field(
+        default=None,
+        description="Peran entitas dalam kasus (Locus Delicti/Korban/Vendor/Auditor/dll)",
+    )
+    address: str | None = Field(
+        default=None, description="Alamat entitas"
+    )
+
+
+class AffiliationMapItem(BaseModel):
+    """Person-to-entity affiliation mapping."""
+
+    person_name: str | None = Field(
+        default=None, description="Nama orang atau pihak yang berafiliasi"
+    )
+    related_entity_id: str | None = Field(
+        default=None,
+        description="ID entitas terkait (merujuk ke entity_registry.id)",
+    )
+    position: str | None = Field(
+        default=None,
+        description="Jabatan/posisi dalam entitas (Direktur/Kepala/Auditor/dll)",
+    )
+    nature_of_relationship: str | None = Field(
+        default=None,
+        description="Sifat hubungan (Struktural/Kepemilikan/Penugasan Resmi/dll)",
+    )
+
+
+class LegalEntityAnalysis(BaseModel):
+    """Analysis of legal entities involved in the case."""
+
+    entity_registry: list[EntityRegistryItem] | None = Field(
+        default=None,
+        description="Daftar entitas/badan hukum yang terlibat dalam kasus",
+    )
+    affiliations_map: list[AffiliationMapItem] | None = Field(
+        default=None,
+        description="Peta afiliasi antara orang dengan entitas",
+    )
+
+
+# =============================================================================
 # Main ExtractionResult Model (Restructured)
 # =============================================================================
 
@@ -837,6 +1075,12 @@ class ExtractionResult(BaseModel):
         default=None, description="Informasi tuntutan Jaksa Penuntut Umum"
     )
 
+    # Defense Strategy (Nested)
+    defense_strategy: DefenseStrategy | None = Field(
+        default=None,
+        description="Strategi pembelaan terdakwa (eksepsi, pledoi, replik/duplik)",
+    )
+
     # Legal Facts (Categorized)
     legal_facts: CategorizedLegalFacts | None = Field(
         default=None, description="Fakta-fakta hukum yang terungkap di persidangan"
@@ -860,6 +1104,12 @@ class ExtractionResult(BaseModel):
     # Case Metadata (Nested)
     case_metadata: CaseMetadata | None = Field(
         default=None, description="Metadata tambahan tentang perkara"
+    )
+
+    # Legal Entity Analysis (Nested)
+    legal_entity_analysis: LegalEntityAnalysis | None = Field(
+        default=None,
+        description="Analisis entitas/badan hukum yang terlibat dalam kasus",
     )
 
     # Additional Case Data (Nested) - for appeal/complex cases
