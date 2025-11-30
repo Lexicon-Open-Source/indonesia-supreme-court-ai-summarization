@@ -6,6 +6,8 @@ from functools import wraps
 import typer
 
 from contexts import AppContexts
+from settings import ExtractionMode, get_settings
+from src.pdf_pipeline import run_pdf_extraction_pipeline
 from src.pipeline import run_extraction_pipeline
 
 # Configure logging for CLI
@@ -51,14 +53,25 @@ async def extract(extraction_id: str):
         logger.info("Initializing application contexts")
         contexts = await CONTEXTS.get_app_contexts(init_nats=False)
 
+        settings = get_settings()
+        logger.info(f"Using extraction mode: {settings.extraction_mode.value}")
+
         logger.info(f"Running extraction pipeline for extraction_id: {extraction_id}")
-        extraction_result, summary_id, summary_en, decision_number = (
-            await run_extraction_pipeline(
-                extraction_id=extraction_id,
-                crawler_db_engine=contexts.crawler_db_engine,
-                case_db_engine=contexts.case_db_engine,
+
+        if settings.extraction_mode == ExtractionMode.PDF:
+            extraction_result, summary_id, summary_en, decision_number = (
+                await run_pdf_extraction_pipeline(
+                    extraction_id=extraction_id,
+                    crawler_db_engine=contexts.crawler_db_engine,
+                )
             )
-        )
+        else:
+            extraction_result, summary_id, summary_en, decision_number = (
+                await run_extraction_pipeline(
+                    extraction_id=extraction_id,
+                    crawler_db_engine=contexts.crawler_db_engine,
+                )
+            )
 
         # Log results
         fields_extracted = len(extraction_result.model_dump(exclude_none=True))

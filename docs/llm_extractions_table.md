@@ -86,6 +86,7 @@ Complete defendant information with structured address.
   "defendant": {
     "name": "ISHAK EFENDI",
     "alias": null,
+    "patronymic": "BIN AHMAD",
     "place_of_birth": "Api-api (Bengkalis)",
     "date_of_birth": "1963-05-03",
     "age": 70,
@@ -111,6 +112,7 @@ Complete defendant information with structured address.
 |-------|------|-------------|
 | `name` | string | Nama lengkap terdakwa |
 | `alias` | string | Nama alias/panggilan (jika ada) |
+| `patronymic` | string | Nama keturunan (BIN/BINTI diikuti nama ayah) |
 | `place_of_birth` | string | Tempat lahir |
 | `date_of_birth` | string | Tanggal lahir (YYYY-MM-DD) |
 | `age` | integer | Umur saat putusan |
@@ -583,7 +585,7 @@ Final court decision.
     "date": "2024-01-18",
     "day": "Kamis",
     "year": 2024,
-    "result": "partially_guilty",
+    "result": "guilty",
     "primary_charge_proven": false,
     "subsidiary_charge_proven": true,
     "proven_articles": [
@@ -649,7 +651,7 @@ Final court decision.
 | `date` | string | Tanggal putusan (YYYY-MM-DD) |
 | `day` | string | Hari pembacaan putusan |
 | `year` | integer | Tahun putusan |
-| `result` | string | Hasil putusan (guilty/partially_guilty/not_guilty/acquitted) |
+| `result` | string | Hasil putusan (guilty/not_guilty/acquitted) |
 | `primary_charge_proven` | boolean | Dakwaan primer terbukti? |
 | `subsidiary_charge_proven` | boolean | Dakwaan subsidiair terbukti? |
 | `proven_articles` | array | Pasal-pasal yang terbukti (termasuk juncto) - menggunakan struktur CitedArticle |
@@ -1043,7 +1045,6 @@ Additional data for complex cases such as appeal cases (banding/kasasi) and mult
 | Value | Description |
 |-------|-------------|
 | `guilty` | Terbukti bersalah |
-| `partially_guilty` | Sebagian terbukti (dakwaan primer tidak, subsidiair terbukti) |
 | `not_guilty` | Bebas |
 | `acquitted` | Lepas dari segala tuntutan |
 
@@ -1073,6 +1074,7 @@ Additional data for complex cases such as appeal cases (banding/kasasi) and mult
   "defendant": {
     "name": "ISHAK EFENDI",
     "alias": null,
+    "patronymic": "BIN AHMAD",
     "place_of_birth": "Api-api (Bengkalis)",
     "date_of_birth": "1963-05-03",
     "age": 70,
@@ -1197,7 +1199,7 @@ Additional data for complex cases such as appeal cases (banding/kasasi) and mult
     "date": "2024-01-18",
     "day": "Kamis",
     "year": 2024,
-    "result": "partially_guilty",
+    "result": "guilty",
     "primary_charge_proven": false,
     "subsidiary_charge_proven": true,
     "proven_articles": [

@@ -9,6 +9,7 @@ This module handles:
 5. Database persistence to llm_extractions table
 """
 
+import asyncio
 import json
 import logging
 import traceback
@@ -33,11 +34,10 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
+from settings import get_settings
+
 logger = logging.getLogger(__name__)
 
-# LLM Model configuration
-MODEL = "gemini/gemini-2.5-flash-lite"
-CHUNK_SIZE = 100  # Number of pages per chunk
 
 
 # =============================================================================
@@ -66,7 +66,6 @@ class ExceptionStatus(str, Enum):
 
 class VerdictResult(str, Enum):
     GUILTY = "guilty"  # Terbukti bersalah
-    PARTIALLY_GUILTY = "partially_guilty"  # Sebagian terbukti
     NOT_GUILTY = "not_guilty"  # Bebas
     ACQUITTED = "acquitted"  # Lepas dari segala tuntutan
 
@@ -116,6 +115,10 @@ class DefendantInfo(BaseModel):
     name: str | None = Field(default=None, description="Nama lengkap terdakwa")
     alias: str | None = Field(
         default=None, description="Nama alias/panggilan terdakwa jika ada"
+    )
+    patronymic: str | None = Field(
+        default=None,
+        description="Nama keturunan terdakwa (BIN/BINTI diikuti nama ayah)",
     )
     place_of_birth: str | None = Field(
         default=None, description="Kota atau tempat kelahiran terdakwa"
@@ -202,17 +205,37 @@ class Judge(BaseModel):
     )
 
 
+class Prosecutor(BaseModel):
+    """Prosecutor information."""
+
+    name: str | None = Field(default=None, description="Nama Jaksa Penuntut Umum")
+    role: str | None = Field(
+        default=None,
+        description="Jabatan/peran jaksa jika ada",
+    )
+
+
+class CourtClerk(BaseModel):
+    """Court clerk information."""
+
+    name: str | None = Field(default=None, description="Nama Panitera Pengganti")
+    role: str | None = Field(
+        default=None,
+        description="Jabatan/peran panitera jika ada",
+    )
+
+
 class CourtPersonnel(BaseModel):
     """All court personnel involved in the case."""
 
     judges: list[Judge] | None = Field(
         default=None, description="Daftar hakim yang menangani perkara"
     )
-    prosecutors: list[str] | None = Field(
-        default=None, description="Nama-nama Jaksa Penuntut Umum"
+    prosecutors: list[Prosecutor] | None = Field(
+        default=None, description="Daftar Jaksa Penuntut Umum"
     )
-    court_clerks: list[str] | None = Field(
-        default=None, description="Nama-nama Panitera Pengganti"
+    court_clerks: list[CourtClerk] | None = Field(
+        default=None, description="Daftar Panitera Pengganti"
     )
 
 
@@ -419,7 +442,7 @@ class Verdict(BaseModel):
     year: int | None = Field(default=None, description="Tahun putusan")
     result: str | None = Field(
         default=None,
-        description="Hasil putusan (guilty/partially_guilty/not_guilty/acquitted)",
+        description="Hasil putusan (guilty/not_guilty/acquitted)",
     )
     primary_charge_proven: bool | None = Field(
         default=None, description="Apakah dakwaan primer terbukti"
@@ -1135,253 +1158,29 @@ class LLMExtraction(SQLModel, table=True):
     )
 
 
-# JSON Schema description for the extraction output
-EXTRACTION_JSON_SCHEMA = """
-The output must be a valid JSON object with this structure:
+def _get_extraction_json_schema() -> str:
+    """
+    Generate JSON schema from ExtractionResult model.
 
-{
-  "defendant": {
-    "name": "string or null",
-    "alias": "string or null",
-    "place_of_birth": "string or null",
-    "date_of_birth": "YYYY-MM-DD or null",
-    "age": "integer or null",
-    "gender": "Laki-laki/Perempuan or null",
-    "citizenship": "string or null",
-    "address": {
-      "street": "string or null",
-      "rt_rw": "string or null",
-      "kelurahan": "string or null",
-      "kecamatan": "string or null",
-      "city": "string or null",
-      "province": "string or null",
-      "full_address": "string or null"
-    },
-    "religion": "string or null",
-    "occupation": "string or null",
-    "education": "string or null"
-  },
-  "legal_counsels": [
-    {
-      "name": "string or null",
-      "office_name": "string or null",
-      "office_address": "string or null"
-    }
-  ],
-  "court": {
-    "case_register_number": "string or null",
-    "verdict_number": "string or null",
-    "court_name": "string or null",
-    "court_level": "Pengadilan Negeri/Pengadilan Tinggi/Mahkamah Agung or null",
-    "province": "string or null",
-    "city": "string or null"
-  },
-  "court_personnel": {
-    "judges": [{"name": "string", "role": "Ketua Majelis/Hakim Anggota"}],
-    "prosecutors": ["string"],
-    "court_clerks": ["string"]
-  },
-  "indictment": {
-    "type": "Tunggal/Alternatif/Subsidiair/Kumulatif/Campuran or null",
-    "chronology": "string or null",
-    "crime_location": "string or null",
-    "crime_period": {
-      "start_date": "YYYY-MM-DD or null",
-      "end_date": "YYYY-MM-DD or null",
-      "description": "string or null"
-    },
-    "cited_articles": [
-      {
-        "article": "string",
-        "law_name": "string",
-        "law_number": "string or null",
-        "law_year": "integer or null",
-        "full_citation": "string"
-      }
-    ],
-    "defense_exception_status": "Ditolak/Diterima/Tidak Ada or null"
-  },
-  "prosecution_demand": {
-    "date": "YYYY-MM-DD or null",
-    "articles": [{"article": "string", "law_name": "string", "full_citation": "string"}],
-    "content": "string or null",
-    "prison_sentence_months": "float or null",
-    "prison_sentence_description": "string or null",
-    "fine_amount": "float or null",
-    "fine_subsidiary_confinement_months": "integer or null",
-    "restitution_amount": "float or null",
-    "restitution_subsidiary_type": "kurungan/penjara or null",
-    "restitution_subsidiary_duration_months": "integer or null"
-  },
-  "defense_strategy": {
-    "exception": {
-      "filed": "boolean or null",
-      "date": "YYYY-MM-DD or null",
-      "summary": "string or null",
-      "primary_arguments": [
-        {
-          "type": "competence/indictment_validity/procedure or null",
-          "description": "string or null",
-          "details": "string or null"
-        }
-      ],
-      "prosecutor_response": {
-        "date": "YYYY-MM-DD or null",
-        "summary": "string or null"
-      },
-      "court_interlocutory_ruling": {
-        "date": "YYYY-MM-DD or null",
-        "decision": "Diterima/Ditolak or null",
-        "reasoning": "string or null"
-      }
-    },
-    "plea": {
-      "date": "YYYY-MM-DD or null",
-      "submitted_by": ["string"],
-      "personal_plea": {
-        "filed": "boolean or null",
-        "summary": "string or null"
-      },
-      "legal_counsel_plea": {
-        "filed": "boolean or null",
-        "summary": "string or null",
-        "key_arguments": [
-          {
-            "point": "unsur_melawan_hukum/unsur_memperkaya_diri/procedural_flaws or null",
-            "argument": "string or null"
-          }
-        ],
-        "specific_requests": ["string"]
-      }
-    },
-    "rejoinders": {
-      "replik": {
-        "date": "YYYY-MM-DD or null",
-        "summary": "string or null"
-      },
-      "duplik": {
-        "date": "YYYY-MM-DD or null",
-        "summary": "string or null"
-      }
-    }
-  },
-  "legal_facts": {
-    "organizational_structure": ["string"],
-    "standard_procedures": ["string"],
-    "violations": ["string"],
-    "financial_irregularities": ["string"],
-    "witness_testimonies": ["string"],
-    "documentary_evidence": ["string"],
-    "other_facts": ["string"]
-  },
-  "judicial_considerations": {
-    "aggravating_factors": ["string"],
-    "mitigating_factors": ["string"]
-  },
-  "verdict": {
-    "number": "string or null",
-    "date": "YYYY-MM-DD or null",
-    "day": "string or null",
-    "year": "integer or null",
-    "result": "guilty/partially_guilty/not_guilty/acquitted or null",
-    "primary_charge_proven": "boolean or null",
-    "subsidiary_charge_proven": "boolean or null",
-    "proven_articles": [
-      {
-        "article": "Pasal X Ayat (Y)",
-        "law_name": "nama undang-undang",
-        "law_number": "string or null",
-        "law_year": "integer or null",
-        "full_citation": "kutipan lengkap pasal jo. juncto"
-      }
-    ],
-    "ruling_contents": ["string"],
-    "sentences": {
-      "imprisonment": {"duration_months": "integer or null", "description": "string or null"},
-      "fine": {"amount": "float or null", "subsidiary_confinement_months": "integer or null"},
-      "restitution": {
-        "amount": "float or null",
-        "already_paid": "float or null",
-        "remaining": "float or null",
-        "subsidiary_type": "kurungan/penjara or null",
-        "subsidiary_duration_months": "integer or null"
-      }
-    }
-  },
-  "state_loss": {
-    "auditor": "string or null",
-    "audit_report_number": "string or null",
-    "audit_report_date": "YYYY-MM-DD or null",
-    "indicted_amount": "float or null",
-    "proven_amount": "float or null",
-    "returned_amount": "float or null",
-    "remaining_due": "float or null",
-    "currency": "IDR",
-    "perpetrators_proceeds": [{"name": "string", "amount": "float", "role": "string"}]
-  },
-  "case_metadata": {
-    "crime_category": "string or null",
-    "crime_subcategory": "string or null",
-    "institution_involved": "string or null",
-    "related_cases": [
-      {"defendant_name": "string", "case_number": "string or null", "status": "string", "relationship": "string"}
-    ]
-  },
-  "legal_entity_analysis": {
-    "entity_registry": [
-      {
-        "id": "string (e.g., ENT_01)",
-        "name": "string or null",
-        "legal_form": "Instansi Pemerintah/PT/CV/Yayasan or null",
-        "sector": "string or null",
-        "role_in_case": "string or null",
-        "address": "string or null"
-      }
-    ],
-    "affiliations_map": [
-      {
-        "person_name": "string or null",
-        "related_entity_id": "string (reference to entity_registry.id)",
-        "position": "string or null",
-        "nature_of_relationship": "Struktural/Kepemilikan/Penugasan Resmi or null"
-      }
-    ]
-  },
-  "additional_case_data": {
-    "detention_history": [
-      {"stage": "string", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "duration_days": "integer", "location": "string"}
-    ],
-    "lower_court_decision": {
-      "court_name": "string or null",
-      "verdict_number": "string or null",
-      "verdict_date": "YYYY-MM-DD or null",
-      "primary_charge_ruling": "string or null",
-      "subsidiary_charge_ruling": "string or null",
-      "sentence": {"imprisonment": "string", "fine": "string", "restitution": "string"}
-    },
-    "appeal_process": {
-      "applicant": "string or null",
-      "request_date": "YYYY-MM-DD or null",
-      "registration_date": "YYYY-MM-DD or null",
-      "notification_to_defendant": "YYYY-MM-DD or null",
-      "notification_to_prosecutor": "YYYY-MM-DD or null",
-      "memorandum_filed": "boolean or null",
-      "memorandum_date": "YYYY-MM-DD or null",
-      "contra_memorandum_filed": "boolean or null",
-      "contra_memorandum_date": "YYYY-MM-DD or null",
-      "judge_notes": "string or null"
-    },
-    "evidence_inventory": {
-      "returned_to_defendant": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "returned_to_third_party": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "confiscated_for_state": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "destroyed": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "attached_to_case_file": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}],
-      "used_in_other_case": [{"item": "string", "recipient": "string", "condition": "string", "status": "string"}]
-    }
-  },
-  "extraction_confidence": "float between 0.0 and 1.0"
-}
+    This includes all field descriptions from the Pydantic model,
+    ensuring the LLM has full context for each field.
+    """
+    schema = ExtractionResult.model_json_schema()
+    return json.dumps(schema, indent=2, ensure_ascii=False)
+
+
+# Generate schema with descriptions from Pydantic model
+EXTRACTION_JSON_SCHEMA = f"""
+The output must be a valid JSON object conforming to this schema:
+
+{_get_extraction_json_schema()}
+
+Key formatting rules:
+- Use null for fields where information is not found
+- Dates must be in YYYY-MM-DD format
+- Monetary values must be numbers without currency symbols (e.g., 1000000000 not "Rp 1.000.000.000")
+- Prison sentences in months (e.g., "1 tahun 6 bulan" = 18)
+- extraction_confidence must be a float between 0.0 and 1.0
 """
 
 # System prompt for extraction
@@ -1505,7 +1304,7 @@ IMPORTANT: Start directly with "## Defendant Identity and Case Information", no 
 """
 
 
-def chunk_document(doc_content: dict[int, str], chunk_size: int = CHUNK_SIZE) -> list[str]:
+def chunk_document(doc_content: dict[int, str], chunk_size: int) -> list[str]:
     """
     Chunk document content into chunks of specified page size.
 
@@ -1543,11 +1342,166 @@ def chunk_document(doc_content: dict[int, str], chunk_size: int = CHUNK_SIZE) ->
     return chunks
 
 
-@retry(
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    stop=stop_after_attempt(5),
-    reraise=True,
-)
+class TruncationError(Exception):
+    """Raised when LLM response is truncated due to token limit."""
+    pass
+
+
+def _sanitize_json_control_chars(s: str) -> str:
+    """
+    Escape control characters inside JSON string values.
+    Control chars (0x00-0x1F) must be escaped when inside JSON strings.
+    """
+    chars = []
+    in_string = False
+    i = 0
+    while i < len(s):
+        char = s[i]
+
+        if not in_string:
+            # Outside string - just copy characters
+            if char == '"':
+                in_string = True
+            chars.append(char)
+            i += 1
+        else:
+            # Inside string
+            if char == "\\" and i + 1 < len(s):
+                # Escape sequence - copy both chars
+                chars.append(s[i : i + 2])
+                i += 2
+            elif char == '"':
+                # End of string
+                in_string = False
+                chars.append(char)
+                i += 1
+            elif ord(char) < 32:
+                # Control character - escape it
+                if char == "\n":
+                    chars.append("\\n")
+                elif char == "\r":
+                    chars.append("\\r")
+                elif char == "\t":
+                    chars.append("\\t")
+                else:
+                    chars.append(f"\\u{ord(char):04x}")
+                i += 1
+            else:
+                chars.append(char)
+                i += 1
+
+    return "".join(chars)
+
+
+async def _call_extraction_llm(
+    messages: list[dict],
+    model: str,
+    chunk_number: int,
+) -> ExtractionResult:
+    """
+    Call LLM for extraction and parse the response.
+
+    Args:
+        messages: The messages to send to the LLM
+        model: The model identifier to use
+        chunk_number: Current chunk number for logging
+
+    Returns:
+        ExtractionResult parsed from LLM response
+
+    Raises:
+        TruncationError: If response was truncated due to token limit
+        json.JSONDecodeError: If response is not valid JSON
+        Exception: If response fails validation
+    """
+    logger.info(f"Chunk {chunk_number}: Calling model {model}")
+
+    response = await acompletion(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+    )
+
+    raw_content = response.choices[0].message.content
+    finish_reason = response.choices[0].finish_reason
+
+    # Check if response was truncated due to token limit
+    if finish_reason == "length":
+        raise TruncationError(
+            f"Chunk {chunk_number}: Response truncated due to max_tokens limit"
+        )
+
+    logger.debug(f"Raw LLM response for chunk {chunk_number}: {raw_content[:500]}...")
+
+    # Clean up response - remove markdown code blocks if present
+    cleaned_content = raw_content.strip()
+    if cleaned_content.startswith("```json"):
+        cleaned_content = cleaned_content[7:]
+    elif cleaned_content.startswith("```"):
+        cleaned_content = cleaned_content[3:]
+    if cleaned_content.endswith("```"):
+        cleaned_content = cleaned_content[:-3]
+    cleaned_content = cleaned_content.strip()
+
+    # Sanitize control characters
+    cleaned_content = _sanitize_json_control_chars(cleaned_content)
+
+    # Parse JSON
+    parsed_json = json.loads(cleaned_content)
+
+    # Validate and create result
+    result = ExtractionResult(**parsed_json)
+
+    # Check if result is mostly empty
+    non_null_fields = sum(1 for v in result.model_dump().values() if v is not None)
+    logger.info(
+        f"Chunk {chunk_number}: extracted {non_null_fields} non-null fields "
+        f"using {model}"
+    )
+
+    if non_null_fields <= 1:  # Only extraction_confidence or nothing
+        logger.warning(
+            f"Chunk {chunk_number} extraction mostly empty. "
+            f"Raw response preview: {raw_content[:200]}"
+        )
+
+    return result
+
+
+async def _try_model_with_retries(
+    messages: list[dict],
+    model: str,
+    chunk_number: int,
+    max_attempts: int = 3,
+) -> ExtractionResult | None:
+    """
+    Try a model with retries. Returns None if all attempts fail.
+
+    Raises TruncationError immediately (no point retrying same model).
+    """
+    for attempt in range(max_attempts):
+        try:
+            return await _call_extraction_llm(messages, model, chunk_number)
+        except TruncationError:
+            # Don't retry truncation with same model
+            raise
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"Chunk {chunk_number}: JSON parse error with {model} "
+                f"(attempt {attempt + 1}/{max_attempts}): {e}"
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            logger.warning(
+                f"Chunk {chunk_number}: Error with {model} "
+                f"(attempt {attempt + 1}/{max_attempts}): {e}"
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 ** attempt)
+    return None
+
+
 async def extract_from_chunk(
     chunk_content: str,
     current_extraction: dict[str, Any],
@@ -1556,6 +1510,9 @@ async def extract_from_chunk(
 ) -> ExtractionResult:
     """
     Extract information from a single document chunk using LLM.
+
+    Tries models in order: primary → fallback → fallback_2
+    Falls back on truncation or persistent errors.
 
     Args:
         chunk_content: Text content of the chunk
@@ -1581,60 +1538,54 @@ async def extract_from_chunk(
         },
     ]
 
-    response = await acompletion(
-        model=MODEL,
-        messages=messages,
-        response_format={"type": "json_object"},
-    )
+    settings = get_settings()
 
-    raw_content = response.choices[0].message.content
-    logger.debug(f"Raw LLM response for chunk {chunk_number}: {raw_content[:500]}...")
+    # Build model chain (skip None/empty and duplicates)
+    model_chain = []
+    seen = set()
+    for model in [
+        settings.extraction_model,
+        settings.extraction_fallback_model,
+        settings.extraction_fallback_model_2,
+    ]:
+        if model and model not in seen:
+            model_chain.append(model)
+            seen.add(model)
 
-    # Clean up response - remove markdown code blocks if present
-    cleaned_content = raw_content.strip()
-    if cleaned_content.startswith("```json"):
-        cleaned_content = cleaned_content[7:]
-    elif cleaned_content.startswith("```"):
-        cleaned_content = cleaned_content[3:]
-    if cleaned_content.endswith("```"):
-        cleaned_content = cleaned_content[:-3]
-    cleaned_content = cleaned_content.strip()
+    if not model_chain:
+        raise ValueError("No extraction models configured")
 
-    parsed_json = None
-    try:
-        parsed_json = json.loads(cleaned_content)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON from chunk {chunk_number}: {e}")
-        logger.error(f"Cleaned content: {cleaned_content[:500]}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise
+    logger.debug(f"Chunk {chunk_number}: Model chain: {' → '.join(model_chain)}")
 
-    try:
-        result = ExtractionResult(**parsed_json)
-
-        # Check if result is mostly empty
-        non_null_fields = sum(
-            1 for v in result.model_dump().values() if v is not None
-        )
-        logger.info(
-            f"Chunk {chunk_number}: extracted {non_null_fields} non-null fields"
-        )
-
-        if non_null_fields <= 1:  # Only extraction_confidence or nothing
+    last_error = None
+    for i, model in enumerate(model_chain):
+        model_label = "Primary" if i == 0 else f"Fallback-{i}"
+        try:
+            result = await _try_model_with_retries(messages, model, chunk_number)
+            if result is not None:
+                if i > 0:
+                    logger.info(
+                        f"Chunk {chunk_number}: {model_label} model {model} succeeded"
+                    )
+                return result
+            # All retries failed, try next model
             logger.warning(
-                f"Chunk {chunk_number} extraction mostly empty. "
-                f"Raw response preview: {raw_content[:200]}"
+                f"Chunk {chunk_number}: {model_label} model {model} failed after retries"
             )
-    except Exception as e:
-        logger.error(f"Failed to validate extraction from chunk {chunk_number}: {e}")
-        logger.error(
-            f"Parsed JSON keys: {list(parsed_json.keys()) if parsed_json else 'N/A'}"
-        )
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise
+        except TruncationError as e:
+            logger.warning(
+                f"Chunk {chunk_number}: {model_label} model {model} truncated, "
+                f"trying next model..."
+            )
+            last_error = e
+            continue
 
-    logger.debug(f"Successfully extracted from chunk {chunk_number}")
-    return result
+    # All models failed
+    logger.error(
+        f"Chunk {chunk_number}: All {len(model_chain)} models failed. "
+        f"Last error: {last_error}"
+    )
+    raise last_error or ValueError(f"Extraction failed for chunk {chunk_number}")
 
 
 @retry(
@@ -1654,8 +1605,9 @@ async def generate_summary_id(extraction_result: dict[str, Any]) -> str:
         },
     ]
 
+    settings = get_settings()
     response = await acompletion(
-        model=MODEL,
+        model=settings.extraction_model,
         messages=messages,
     )
 
@@ -1679,8 +1631,9 @@ async def generate_summary_en(extraction_result: dict[str, Any]) -> str:
         },
     ]
 
+    settings = get_settings()
     response = await acompletion(
-        model=MODEL,
+        model=settings.extraction_model,
         messages=messages,
     )
 
@@ -1714,9 +1667,11 @@ async def process_document_extraction(
     )
 
     # Step 1: Chunk the document
-    chunks = chunk_document(doc_content)
+    settings = get_settings()
+    chunk_size = settings.extraction_chunk_size
+    chunks = chunk_document(doc_content, chunk_size=chunk_size)
     total_chunks = len(chunks)
-    logger.info(f"Document split into {total_chunks} chunks")
+    logger.info(f"Document split into {total_chunks} chunks (chunk_size={chunk_size} pages)")
 
     if total_chunks == 0:
         logger.error(f"No chunks created for decision: {decision_number}")

@@ -70,7 +70,7 @@ CASE_DB_SCHEMA=bo_v1
 NATS__URL=nats://localhost:4222
 
 # Service
-SERVICE_PORT=8004
+PORT=8004
 
 # Optional: Google Cloud Storage
 GCP_PROJECT_ID=
@@ -228,7 +228,7 @@ docker compose down
 
 ```bash
 # Build
-docker build -t court-extraction-api --build-arg SERVICE_PORT=8004 .
+docker build -t court-extraction-api --build-arg PORT=8004 .
 
 # Run (requires external NATS and PostgreSQL)
 docker run -p 8004:8004 --env-file .env court-extraction-api

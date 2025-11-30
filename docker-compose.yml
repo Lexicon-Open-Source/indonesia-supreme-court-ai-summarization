@@ -6,10 +6,10 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        SERVICE_PORT: ${SERVICE_PORT:-8004}
+        PORT: ${PORT:-8004}
     container_name: court-extraction-api
     ports:
-      - "${SERVICE_PORT:-8004}:${SERVICE_PORT:-8004}"
+      - "${PORT:-8004}:${PORT:-8004}"
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - CRAWLER_DB_ADDR=${CRAWLER_DB_ADDR}
@@ -22,7 +22,7 @@ services:
       - CASE_DB_SCHEMA=${CASE_DB_SCHEMA:-bo_v1}
       - NATS__URL=${NATS__URL:-nats://nats:4222}
       - NATS__NUM_OF_SUMMARIZER_CONSUMER_INSTANCES=${NATS__NUM_OF_SUMMARIZER_CONSUMER_INSTANCES:-3}
-      - SERVICE_PORT=${SERVICE_PORT:-8004}
+      - PORT=${PORT:-8004}
       - GCP_PROJECT_ID=${GCP_PROJECT_ID:-}
       - GCP_CREDENTIALS_BASE64=${GCP_CREDENTIALS_BASE64:-}
     depends_on:
@@ -32,7 +32,7 @@ services:
     networks:
       - extraction-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${SERVICE_PORT:-8004}/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8004}/health"]
       interval: 30s
       timeout: 10s
       retries: 3

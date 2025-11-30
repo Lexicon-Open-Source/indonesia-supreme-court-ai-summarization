@@ -21,8 +21,7 @@ RUN apt-get update && \
     tesseract-ocr \
     tesseract-ocr-ind \
     ca-certificates \
-    python3-dev \
-    default-libmysqlclient-dev && \
+    python3-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -33,7 +32,7 @@ RUN curl -LsSf https://astral.sh/uv/0.9.10/install.sh | sh && \
 # Copy application files
 COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
-COPY main.py cli.py contexts.py settings.py nats_consumer.py entrypoint.sh ./
+COPY main.py cli.py settings.py entrypoint.sh ./
 
 # Make entrypoint executable
 RUN chmod u+x entrypoint.sh
@@ -42,12 +41,12 @@ RUN chmod u+x entrypoint.sh
 RUN uv sync --frozen
 
 # Expose port
-ARG SERVICE_PORT=8004
-ENV SERVICE_PORT=${SERVICE_PORT}
-EXPOSE ${SERVICE_PORT}
+ARG PORT=8004
+ENV PORT=${PORT}
+EXPOSE ${PORT}
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${SERVICE_PORT}/health || exit 1
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 ENTRYPOINT ["./entrypoint.sh"]
