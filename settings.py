@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     pubsub__dlq_subscription_name: str = "supreme-court-extraction-dlq-sub"
     pubsub__num_of_consumer_instances: int = 3
 
+    # Pub/Sub embedding queue configuration
+    pubsub__embedding_topic_name: str = "supreme-court-extraction-embedding"
+    pubsub__embedding_subscription_name: str = "supreme-court-extraction-embedding-sub"
+
     async_http_request_timeout: int = 300
 
     # LLM extraction settings
@@ -80,6 +84,12 @@ class Settings(BaseSettings):
     extraction_model: str = "gemini/gemini-2.5-flash-lite"  # Primary model
     extraction_fallback_model: str | None = "gemini/gemini-2.5-flash"  # Fallback 1
     extraction_fallback_model_2: str | None = "gemini/gemini-2.5-pro"  # Fallback 2
+
+    # Embedding settings for AI Agent council
+    embedding_model: str = "gemini/gemini-embedding-001"
+    embedding_dimensions: int = 768  # Recommended: 768, 1536, or 3072
+    embedding_task_type: str = "RETRIEVAL_DOCUMENT"  # For indexing documents
+    embedding_enabled: bool = True  # Enable/disable embedding generation
 
     # Optional: Google Cloud Storage settings
     gcp_project_id: str | None = None
@@ -139,10 +149,14 @@ class Settings(BaseSettings):
         """
         Get SQLAlchemy connect_args based on configuration.
 
+        Includes 'public' schema for pgvector extension access.
+
         Returns:
             Dictionary of connection arguments for create_async_engine
         """
-        return {"server_settings": {"search_path": self.db_schema}}
+        # Include public schema for pgvector extension (vector type is in public)
+        search_path = f"{self.db_schema},public"
+        return {"server_settings": {"search_path": search_path}}
 
 
 def _decode_and_save_credentials(base64_credentials: str) -> str:

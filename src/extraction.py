@@ -20,6 +20,7 @@ from typing import Any
 
 import litellm
 from litellm import acompletion
+from pgvector.sqlalchemy import Vector
 from pydantic import BaseModel, Field
 from sqlalchemy import TIMESTAMP
 from sqlalchemy.dialects.postgresql import JSONB
@@ -1149,6 +1150,19 @@ class LLMExtraction(SQLModel, table=True):
     summary_id: str | None = SQLField(default=None)
     extraction_confidence: float | None = SQLField(default=None)
     status: str = SQLField(default=ExtractionStatus.PENDING.value)
+
+    # Embedding columns for semantic search (768 dims, gemini-embedding-001)
+    content_embedding: Any = SQLField(
+        default=None, sa_column=Column(Vector(768), nullable=True)
+    )
+    summary_embedding_id: Any = SQLField(
+        default=None, sa_column=Column(Vector(768), nullable=True)
+    )
+    summary_embedding_en: Any = SQLField(
+        default=None, sa_column=Column(Vector(768), nullable=True)
+    )
+    embedding_generated: bool = SQLField(default=False)
+
     created_at: datetime = SQLField(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(TIMESTAMP(timezone=True), nullable=False),

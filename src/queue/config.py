@@ -14,6 +14,7 @@ class QueueSubject(str, Enum):
 
     # Use .summarize to match existing stream subject
     EXTRACTION = "SUPREME_COURT_SUMMARIZATION_EVENT.summarize"
+    EMBEDDING = "SUPREME_COURT_SUMMARIZATION_EVENT.embedding"
     DEAD_LETTER = "SUPREME_COURT_SUMMARIZATION_EVENT.dead_letter"
 
 
@@ -126,8 +127,44 @@ class WorkerSettings:
     health_check_interval: float = 60.0  # Interval for health reporting
 
 
+@dataclass
+class EmbeddingConsumerSettings:
+    """JetStream consumer settings for embedding generation tasks."""
+
+    durable_name: str = "SUPREME_COURT_EMBEDDING"
+    filter_subject: str = QueueSubject.EMBEDDING.value
+
+    # Acknowledgment settings - embedding is faster than extraction
+    ack_wait: int = 120  # 2 minutes per embedding
+
+    # Redelivery settings
+    max_deliver: int = 3
+
+    # Flow control - can handle more concurrent tasks
+    max_ack_pending: int = 20
+
+    # Batch settings
+    fetch_batch_size: int = 1
+    fetch_timeout_idle: float = 30.0
+    fetch_timeout_busy: float = 1.0
+
+    # Heartbeat settings
+    heartbeat_interval: int = 30
+
+    def to_consumer_config(self) -> ConsumerConfig:
+        """Convert to NATS ConsumerConfig."""
+        return ConsumerConfig(
+            durable_name=self.durable_name,
+            filter_subject=self.filter_subject,
+            ack_wait=self.ack_wait,
+            max_deliver=self.max_deliver,
+            max_ack_pending=self.max_ack_pending,
+        )
+
+
 # Default configurations
 DEFAULT_STREAM_SETTINGS = StreamSettings()
 DEFAULT_CONSUMER_SETTINGS = ConsumerSettings()
+DEFAULT_EMBEDDING_CONSUMER_SETTINGS = EmbeddingConsumerSettings()
 DEFAULT_DEAD_LETTER_SETTINGS = DeadLetterSettings()
 DEFAULT_WORKER_SETTINGS = WorkerSettings()

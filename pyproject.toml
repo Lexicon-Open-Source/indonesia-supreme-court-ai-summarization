@@ -3,7 +3,7 @@ name = "indonesia-supreme-court-ai-postprocess"
 version = "0.1.0"
 description = "Backend services to enable postprocessing features related to Indonesia Supreme Court documents"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = [
   "aiofiles>=24.1.0",
   "asyncpg>=0.30.0",
@@ -14,8 +14,10 @@ dependencies = [
   "litellm>=1.52.9",
   "markdown>=3.7",
   "nats-py>=2.9.0",
+  "numpy>=1.24.0",
   "pdf2image>=1.16.3",
   "pdfminer.six>=20231228",
+  "pgvector>=0.3.0",
   "pypdf>=4.0.0",
   "pytesseract>=0.3.10",
   "pydantic-settings>=2.5.2",
