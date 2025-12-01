@@ -724,6 +724,7 @@ class AgentOrchestrator:
         similar_cases: list[SimilarCase],
         history: list[DeliberationMessage],
         num_rounds: int = 1,
+        agents_filter: list[AgentId] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """
         Continue the judicial discussion with streaming responses.
@@ -734,6 +735,8 @@ class AgentOrchestrator:
             similar_cases: Similar cases for reference
             history: Full message history so far
             num_rounds: Number of discussion rounds
+            agents_filter: Optional list of agents to include. If provided, only
+                these agents will speak. If None, all agents speak.
 
         Yields:
             StreamEvent objects for the continued discussion
@@ -747,6 +750,14 @@ class AgentOrchestrator:
 
         for round_num in range(num_rounds):
             speaker_order = self._get_discussion_order(current_history)
+
+            # Filter agents if specified
+            if agents_filter is not None:
+                speaker_order = [
+                    agent_id
+                    for agent_id in speaker_order
+                    if agent_id in agents_filter
+                ]
 
             for agent_id in speaker_order:
                 agent = self.agents[agent_id]

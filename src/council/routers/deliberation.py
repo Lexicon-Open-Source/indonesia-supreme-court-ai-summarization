@@ -273,10 +273,26 @@ async def generate_opinion(
         )
 
     if len(session.messages) < 3:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST,
-            detail="Need at least 3 messages to generate opinion",
+        # Count agent messages to provide helpful guidance
+        agent_message_count = sum(
+            1 for msg in session.messages if hasattr(msg.sender, "agent_id")
         )
+
+        if agent_message_count < 3:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    f"Need initial opinions from all 3 judges before "
+                    f"generating opinion (currently {agent_message_count}/3). "
+                    f"Call POST /{session_id}/stream/initial first to "
+                    f"complete initial deliberation."
+                ),
+            )
+        else:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Need at least 3 messages to generate opinion",
+            )
 
     logger.info(f"Generating opinion for session {session_id}")
 
@@ -473,8 +489,23 @@ async def stream_initial_opinions(
     else:
         similar_cases = session.similar_cases
 
-    # Use continue_discussion_stream to get remaining judges' opinions
-    # This will check who has spoken and get responses from others
+    # Determine which judges haven't spoken yet
+    from src.council.schemas import AgentId
+
+    judges_spoken = {
+        msg.sender.agent_id
+        for msg in session.messages
+        if hasattr(msg.sender, "agent_id")
+    }
+    judges_remaining = [
+        agent_id for agent_id in AgentId if agent_id not in judges_spoken
+    ]
+
+    logger.info(
+        f"Judges remaining to speak: {[j.value for j in judges_remaining]}"
+    )
+
+    # Stream opinions from remaining judges only
     orchestrator = get_agent_orchestrator()
     event_stream = orchestrator.continue_discussion_stream(
         session_id=session_id,
@@ -482,6 +513,7 @@ async def stream_initial_opinions(
         similar_cases=similar_cases,
         history=session.messages,
         num_rounds=1,
+        agents_filter=judges_remaining,
     )
 
     return StreamingResponse(
@@ -606,10 +638,26 @@ async def stream_continue_discussion(
         )
 
     if len(session.messages) < 3:
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_REQUEST,
-            detail="Need at least 3 messages before continuing discussion",
+        # Count agent messages to provide helpful guidance
+        agent_message_count = sum(
+            1 for msg in session.messages if hasattr(msg.sender, "agent_id")
         )
+
+        if agent_message_count < 3:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    f"Need initial opinions from all 3 judges before "
+                    f"continuing discussion (currently {agent_message_count}/3). "
+                    f"Call POST /{session_id}/stream/initial first to "
+                    f"complete initial deliberation."
+                ),
+            )
+        else:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Need at least 3 messages before continuing discussion",
+            )
 
     logger.info(
         f"Streaming continued discussion for session {session_id}, "
