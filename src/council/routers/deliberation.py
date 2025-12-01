@@ -11,18 +11,22 @@ Provides endpoints for:
 import json
 import logging
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import Annotated
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from src.council.agents.orchestrator import StreamEvent, get_agent_orchestrator
-from src.council.database import CaseDatabase, get_session_store
+from src.council.database import CaseDatabase, SessionStore, get_session_store
 from src.council.schemas import (
+    AgentSender,
     ContinueDiscussionRequest,
     ContinueDiscussionResponse,
+    DeliberationMessage,
     GenerateOpinionRequest,
     GenerateOpinionResponse,
     GetMessagesResponse,
@@ -33,6 +37,7 @@ from src.council.schemas import (
     StreamEventData,
     StreamEventType,
     StreamMessageRequest,
+    UserSender,
 )
 from src.council.services.opinion_generator import get_opinion_generator_service
 from src.council.services.pdf_generator import get_pdf_generator_service
@@ -348,6 +353,57 @@ async def _stream_generator(
         yield _stream_event_to_sse(event)
 
 
+async def _stream_with_persistence(
+    events: AsyncIterator[StreamEvent],
+    session_id: str,
+    store: SessionStore,
+) -> AsyncIterator[str]:
+    """
+    Generator that persists messages to DB as they complete, then yields SSE.
+
+    Intercepts:
+    - user_message events: saves user message to database
+    - agent_complete events: saves agent message to database
+
+    All events are yielded to the client unchanged.
+    """
+    async for event in events:
+        # Persist user message when recorded
+        if event.event_type == "user_message":
+            user_msg = DeliberationMessage(
+                id=event.message_id or str(uuid4()),
+                session_id=session_id,
+                sender=UserSender(),
+                content=event.content,
+                timestamp=datetime.now(UTC),
+            )
+            try:
+                await store.add_message(session_id, user_msg)
+                logger.debug(f"Persisted user message: {user_msg.id}")
+            except Exception as e:
+                logger.error(f"Failed to persist user message: {e}")
+
+        # Persist agent message when complete
+        elif event.event_type == "agent_complete" and event.agent_id:
+            agent_msg = DeliberationMessage(
+                id=event.message_id or str(uuid4()),
+                session_id=session_id,
+                sender=AgentSender(agent_id=event.agent_id),
+                content=event.full_content or event.content,
+                timestamp=datetime.now(UTC),
+            )
+            try:
+                await store.add_message(session_id, agent_msg)
+                logger.debug(
+                    f"Persisted agent message from {event.agent_id}: {agent_msg.id}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to persist agent message: {e}")
+
+        # Always yield the event to the client
+        yield _stream_event_to_sse(event)
+
+
 @router.post("/{session_id}/stream/initial")
 async def stream_initial_opinions(
     session_id: str,
@@ -429,7 +485,7 @@ async def stream_initial_opinions(
     )
 
     return StreamingResponse(
-        _stream_generator(event_stream),
+        _stream_with_persistence(event_stream, session_id, store),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -503,7 +559,7 @@ async def stream_message_response(
     )
 
     return StreamingResponse(
-        _stream_generator(event_stream),
+        _stream_with_persistence(event_stream, session_id, store),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -582,7 +638,7 @@ async def stream_continue_discussion(
     )
 
     return StreamingResponse(
-        _stream_generator(event_stream),
+        _stream_with_persistence(event_stream, session_id, store),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
