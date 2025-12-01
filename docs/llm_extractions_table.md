@@ -555,6 +555,11 @@ Judge's considerations in sentencing.
 ```json
 {
   "judicial_considerations": {
+    "legal_element_considerations": [
+      "Menimbang, bahwa unsur 'Setiap Orang' telah terpenuhi karena terdakwa adalah subjek hukum yang mampu bertanggung jawab",
+      "Menimbang, bahwa unsur 'secara melawan hukum' telah terbukti berdasarkan fakta-fakta hukum di persidangan",
+      "Menimbang, bahwa unsur 'memperkaya diri sendiri atau orang lain atau suatu korporasi' telah terpenuhi"
+    ],
     "aggravating_factors": [
       "Perbuatan terdakwa bertentangan dengan kebijakan pemerintah yang gencar memberantas tindak pidana korupsi"
     ],
@@ -569,6 +574,7 @@ Judge's considerations in sentencing.
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `legal_element_considerations` | array | Pertimbangan hakim terhadap unsur-unsur hukum (biasanya dengan keyword "menimbang" yang membahas unsur pasal) |
 | `aggravating_factors` | array | Hal yang memberatkan |
 | `mitigating_factors` | array | Hal yang meringankan |
 

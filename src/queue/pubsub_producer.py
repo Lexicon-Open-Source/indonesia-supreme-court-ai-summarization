@@ -41,6 +41,7 @@ class PubSubProducer(BaseProducer):
         publish_timeout: float = DEFAULT_PUBLISH_TIMEOUT,
         max_concurrent_publishes: int = DEFAULT_MAX_CONCURRENT_PUBLISHES,
         shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
+        embedding_topic_name: str | None = None,
     ):
         self.pubsub_config = pubsub_config
         self.topic_settings = topic_settings
@@ -51,6 +52,10 @@ class PubSubProducer(BaseProducer):
         self._semaphore: asyncio.Semaphore | None = None
         self._max_concurrent_publishes = max_concurrent_publishes
         self._executor: ThreadPoolExecutor | None = None
+        # Embedding topic: use explicit name or default to {main_topic}-embedding
+        self._embedding_topic_name = (
+            embedding_topic_name or f"{topic_settings.name}-embedding"
+        )
 
     @property
     def is_connected(self) -> bool:
@@ -226,6 +231,58 @@ class PubSubProducer(BaseProducer):
         else:
             logger.error(
                 f"Failed to publish extraction {extraction_id}: {result.error}"
+            )
+
+        return result
+
+    async def publish_embedding(
+        self,
+        extraction_id: str,
+        force: bool = False,
+    ) -> PublishResult:
+        """
+        Publish an embedding generation job to the queue.
+
+        Uses extraction_id as message attribute for deduplication tracking.
+
+        Args:
+            extraction_id: ID of the extraction to generate embeddings for
+            force: Force regeneration even if embedding already exists
+
+        Returns:
+            PublishResult with publish outcome
+        """
+        payload = {
+            "extraction_id": extraction_id,
+            "force": force,
+        }
+
+        # Use extraction_id with suffix as dedup_id attribute
+        msg_id = f"emb-{extraction_id}-{force}"
+        headers = {
+            "extraction_id": extraction_id,
+            "job_type": "embedding",
+        }
+
+        # Use configured embedding topic
+        embedding_topic = self._embedding_topic_name
+
+        result = await self.publish(
+            subject=embedding_topic,
+            payload=payload,
+            headers=headers,
+            msg_id=msg_id,
+        )
+
+        if result.success:
+            logger.debug(
+                f"Published embedding {extraction_id} "
+                f"to topic={embedding_topic}, "
+                f"msg_id={result.message_id}"
+            )
+        else:
+            logger.error(
+                f"Failed to publish embedding {extraction_id}: {result.error}"
             )
 
         return result

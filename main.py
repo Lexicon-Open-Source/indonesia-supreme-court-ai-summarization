@@ -22,16 +22,24 @@ from fastapi import Depends, FastAPI, Query
 from fastapi.exceptions import HTTPException
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from settings import QueueBackendType, _temp_credentials_file, get_settings
+from src.embedding import (
+    SearchResult,
+    ensure_pgvector_extension,
+    find_similar_cases,
+    get_extractions_needing_embeddings,
+    semantic_search,
+)
 from src.extraction import ExtractionStatus, LLMExtraction
 from src.io import Extraction
 from src.queue import (
+    EmbeddingHandler,
     ExtractionHandler,
     QueueSubject,
 )
@@ -119,6 +127,35 @@ class BatchExtractionResponse(BaseModel):
 
 
 # =============================================================================
+# Semantic Search Request/Response Models
+# =============================================================================
+
+
+class SemanticSearchRequest(BaseModel):
+    query: str = Field(..., description="Search query text")
+    limit: int = Field(default=10, ge=1, le=100, description="Max results")
+    crime_category: str | None = Field(
+        default=None, description="Filter by crime category"
+    )
+    search_type: str = Field(
+        default="content",
+        description="Embedding: 'content', 'summary_id', or 'summary_en'",
+    )
+
+
+class SemanticSearchResponse(BaseModel):
+    query: str
+    results: list[SearchResult]
+    total: int
+
+
+class SimilarCasesResponse(BaseModel):
+    extraction_id: str
+    similar_cases: list[SearchResult]
+    total: int
+
+
+# =============================================================================
 # Application State
 # =============================================================================
 
@@ -128,6 +165,7 @@ class AppState:
 
     def __init__(self):
         self.consumer: BaseConsumer | None = None
+        self.embedding_consumer: BaseConsumer | None = None
         self.producer: BaseProducer | None = None
         self.queue_config: QueueConfig | None = None
         self.crawler_db_engine: AsyncEngine | None = None
@@ -430,6 +468,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         )
         producer_kwargs = {producer_key: extra_kwargs.get(producer_key)}
 
+        # Add embedding topic name for Pub/Sub backend
+        if backend == QueueBackend.PUBSUB:
+            producer_kwargs["embedding_topic_name"] = (
+                settings.pubsub__embedding_topic_name
+            )
+
         app_state.producer = create_producer_from_consumer(
             app_state.queue_config,
             app_state.consumer,
@@ -437,6 +481,72 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         )
         await app_state.producer.connect()
         logger.info(f"{backend.value.upper()} producer initialized")
+
+        # Initialize embedding consumer if enabled
+        if settings.embedding_enabled:
+            embedding_handler = EmbeddingHandler(
+                crawler_db_engine=app_state.crawler_db_engine,
+            )
+
+            # Build embedding-specific consumer settings
+            if backend == QueueBackend.NATS:
+                from src.queue.config import (
+                    ConsumerSettings,
+                    StreamSettings,
+                    WorkerSettings,
+                )
+
+                embedding_kwargs = {
+                    "stream_settings": StreamSettings(),
+                    "consumer_settings": ConsumerSettings(
+                        durable_name="SUPREME_COURT_EMBEDDING",
+                        filter_subject=QueueSubject.EMBEDDING.value,
+                        ack_wait=120,
+                        max_deliver=3,
+                        max_ack_pending=20,
+                    ),
+                    "worker_settings": WorkerSettings(
+                        num_workers=settings.get_num_consumer_instances(),
+                        shutdown_timeout=60.0,
+                    ),
+                }
+            else:
+                # For Pub/Sub, configure embedding-specific topic and subscription
+                from src.queue.pubsub_config import (
+                    PubSubSubscriptionSettings,
+                    PubSubTopicSettings,
+                    PubSubWorkerSettings,
+                )
+
+                embedding_kwargs = {
+                    "topic_settings": PubSubTopicSettings(
+                        name=settings.pubsub__embedding_topic_name,
+                    ),
+                    "subscription_settings": PubSubSubscriptionSettings(
+                        name=settings.pubsub__embedding_subscription_name,
+                        topic_name=settings.pubsub__embedding_topic_name,
+                        # No DLQ for embedding jobs - they can be retried via backfill
+                        dead_letter_topic=None,
+                        max_delivery_attempts=5,
+                    ),
+                    "dead_letter_settings": None,
+                    "worker_settings": PubSubWorkerSettings(
+                        num_workers=settings.get_num_consumer_instances(),
+                        shutdown_timeout=60.0,
+                    ),
+                }
+
+            app_state.embedding_consumer = create_consumer(
+                app_state.queue_config,
+                embedding_handler,
+                **embedding_kwargs,
+            )
+            await app_state.embedding_consumer.connect()
+            await app_state.embedding_consumer.start()
+            logger.info(
+                f"{backend.value.upper()} embedding consumer started with "
+                f"{settings.get_num_consumer_instances()} workers"
+            )
 
     except Exception as e:
         logger.error(f"Failed to initialize {backend.value.upper()}: {e}")
@@ -463,6 +573,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             await app_state._stale_recovery_task
         except asyncio.CancelledError:
             pass
+
+    if app_state.embedding_consumer:
+        await app_state.embedding_consumer.shutdown()
 
     if app_state.consumer:
         await app_state.consumer.shutdown()
@@ -1073,3 +1186,314 @@ async def purge_queue_stream(
     except Exception as e:
         logger.error(f"Failed to purge stream: {e}")
         return {"error": str(e)}
+
+
+# =============================================================================
+# Semantic Search Endpoints (AI Agent Council)
+# =============================================================================
+
+
+@app.post(
+    "/search/semantic",
+    response_model=SemanticSearchResponse,
+    tags=["Semantic Search"],
+    summary="Semantic search across case embeddings",
+)
+async def search_cases_semantic(
+    payload: SemanticSearchRequest,
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> SemanticSearchResponse:
+    """
+    Perform semantic search across court case embeddings.
+
+    This endpoint allows AI agents to find relevant cases based on meaning,
+    not just keyword matching. Useful for:
+    - Finding similar precedents
+    - Legal research queries
+    - Case law analysis
+
+    The search uses cosine similarity with vector embeddings generated
+    from case summaries and structured extraction data.
+    """
+    logger.info(
+        f"Semantic search: query='{payload.query[:50]}...', limit={payload.limit}"
+    )
+
+    try:
+        results = await semantic_search(
+            db_engine=crawler_db,
+            query=payload.query,
+            limit=payload.limit,
+            crime_category=payload.crime_category,
+            search_type=payload.search_type,
+        )
+
+        return SemanticSearchResponse(
+            query=payload.query,
+            results=results,
+            total=len(results),
+        )
+    except Exception as e:
+        logger.error(f"Semantic search failed: {e}")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail=f"Search failed: {str(e)}",
+        )
+
+
+@app.get(
+    "/search/similar/{extraction_id}",
+    response_model=SimilarCasesResponse,
+    tags=["Semantic Search"],
+    summary="Find similar cases to a given extraction",
+)
+async def get_similar_cases(
+    extraction_id: str,
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+    limit: int = Query(default=10, ge=1, le=50, description="Max results"),
+) -> SimilarCasesResponse:
+    """
+    Find cases semantically similar to a given extraction.
+
+    This is useful for:
+    - Finding precedent cases
+    - Comparing similar corruption schemes
+    - Identifying related judgments
+    """
+    logger.info(f"Finding similar cases for: {extraction_id}")
+
+    try:
+        results = await find_similar_cases(
+            db_engine=crawler_db,
+            extraction_id=extraction_id,
+            limit=limit,
+        )
+
+        return SimilarCasesResponse(
+            extraction_id=extraction_id,
+            similar_cases=results,
+            total=len(results),
+        )
+    except Exception as e:
+        logger.error(f"Similar cases search failed: {e}")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail=f"Search failed: {str(e)}",
+        )
+
+
+@app.get(
+    "/embeddings/stats",
+    tags=["Semantic Search"],
+    summary="Get embedding statistics",
+)
+async def get_embedding_stats(
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict[str, Any]:
+    """Get statistics about the case embeddings stored in llm_extractions."""
+    async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
+
+    async with async_session() as session:
+        # Total extractions with embeddings
+        total_result = await session.execute(
+            select(func.count())
+            .select_from(LLMExtraction)
+            .where(
+                LLMExtraction.embedding_generated == True  # noqa: E712
+            )
+        )
+        total = total_result.scalar_one()
+
+        # Total extractions without embeddings (pending)
+        pending_result = await session.execute(
+            select(func.count())
+            .select_from(LLMExtraction)
+            .where(
+                LLMExtraction.embedding_generated == False,  # noqa: E712
+                LLMExtraction.status == ExtractionStatus.COMPLETED.value,
+            )
+        )
+        pending = pending_result.scalar_one()
+
+        # By crime category (using JSONB query)
+        category_result = await session.execute(
+            text("""
+                SELECT
+                    COALESCE(
+                        extraction_result->>'crime_category',
+                        extraction_result->'case_metadata'->>'crime_category',
+                        'Unknown'
+                    ) as crime_category,
+                    COUNT(*) as count
+                FROM llm_extractions
+                WHERE embedding_generated = TRUE
+                GROUP BY 1
+                ORDER BY count DESC
+            """)
+        )
+        by_category = {
+            row.crime_category: row.count for row in category_result.fetchall()
+        }
+
+        # By verdict result (using JSONB query)
+        verdict_result = await session.execute(
+            text("""
+                SELECT
+                    COALESCE(
+                        extraction_result->'verdict'->>'result',
+                        'Unknown'
+                    ) as verdict_result,
+                    COUNT(*) as count
+                FROM llm_extractions
+                WHERE embedding_generated = TRUE
+                GROUP BY 1
+                ORDER BY count DESC
+            """)
+        )
+        by_verdict = {
+            row.verdict_result: row.count for row in verdict_result.fetchall()
+        }
+
+    settings = get_settings()
+
+    return {
+        "total_embeddings": total,
+        "pending_embeddings": pending,
+        "by_crime_category": by_category,
+        "by_verdict_result": by_verdict,
+        "embedding_config": {
+            "model": settings.embedding_model,
+            "dimensions": settings.embedding_dimensions,
+            "task_type": settings.embedding_task_type,
+            "enabled": settings.embedding_enabled,
+        },
+    }
+
+
+@app.post(
+    "/embeddings/initialize",
+    tags=["Semantic Search"],
+    summary="Initialize pgvector extension",
+)
+async def initialize_embeddings(
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> dict[str, str]:
+    """
+    Initialize the pgvector extension in the database.
+
+    This must be run once before using embedding features.
+    Requires superuser privileges on the database.
+    """
+    try:
+        await ensure_pgvector_extension(crawler_db)
+        return {"message": "pgvector extension initialized successfully"}
+    except Exception as e:
+        logger.error(f"Failed to initialize pgvector: {e}")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail=f"Failed to initialize: {str(e)}",
+        )
+
+
+class BackfillRequest(BaseModel):
+    limit: int | None = Field(
+        default=None, ge=1, description="Max extractions to queue (None = all)"
+    )
+    concurrency: int = Field(
+        default=10, ge=1, le=50, description="Number of concurrent publish operations"
+    )
+    force: bool = Field(
+        default=False, description="Force regeneration even if embedding exists"
+    )
+
+
+class BackfillResponse(BaseModel):
+    message: str
+    total_pending: int
+    queued: int
+    failed: int
+
+
+@app.post(
+    "/embeddings/backfill",
+    response_model=BackfillResponse,
+    tags=["Semantic Search"],
+    summary="Queue embedding jobs for existing extractions",
+)
+async def backfill_embeddings(
+    payload: BackfillRequest,
+    crawler_db: Annotated[AsyncEngine, Depends(get_crawler_db)],
+    producer: Annotated[BaseProducer, Depends(get_producer)],
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> BackfillResponse:
+    """
+    Queue embedding jobs for existing extractions that don't have embeddings.
+
+    This endpoint finds completed extractions without embeddings and publishes
+    them to the embedding queue for async processing by worker consumers.
+
+    The embedding consumer will:
+    1. Validate the extraction exists and is completed
+    2. Generate summary embeddings (ID and EN) via Gemini API
+    3. Save embeddings directly to llm_extractions table
+
+    Use this to backfill embeddings after enabling the feature on an
+    existing database with historical extractions.
+    """
+    # Find completed extractions without embeddings (or all if force=True)
+    if payload.force:
+        # If forcing, queue all completed extractions
+        async_session = async_sessionmaker(bind=crawler_db, class_=AsyncSession)
+        async with async_session() as session:
+            query = (
+                select(LLMExtraction.extraction_id)
+                .where(
+                    LLMExtraction.status == ExtractionStatus.COMPLETED.value,
+                    LLMExtraction.extraction_result.is_not(None),
+                )
+                .order_by(LLMExtraction.created_at.desc())
+            )
+            if payload.limit:
+                query = query.limit(payload.limit)
+            result = await session.execute(query)
+            pending_ids = [row[0] for row in result.fetchall()]
+    else:
+        # Use the helper function that checks embedding_generated flag
+        pending_ids = await get_extractions_needing_embeddings(
+            db_engine=crawler_db,
+            limit=payload.limit or 1000,
+        )
+
+    total_pending = len(pending_ids)
+    logger.info(f"Backfill: found {total_pending} extractions to queue for embedding")
+
+    if total_pending == 0:
+        return BackfillResponse(
+            message="No extractions pending embedding generation",
+            total_pending=0,
+            queued=0,
+            failed=0,
+        )
+
+    # Publish to embedding queue
+    results = await producer.publish_embedding_batch(
+        extraction_ids=pending_ids,
+        max_concurrent=payload.concurrency,
+        force=payload.force,
+    )
+
+    queued = sum(1 for r in results.values() if r.success)
+    failed = sum(1 for r in results.values() if not r.success)
+
+    logger.info(f"Backfill: queued {queued}/{total_pending} embedding jobs")
+
+    return BackfillResponse(
+        message=f"Embedding jobs queued: {queued} queued, {failed} failed",
+        total_pending=total_pending,
+        queued=queued,
+        failed=failed,
+    )

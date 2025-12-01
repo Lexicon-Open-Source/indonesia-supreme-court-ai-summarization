@@ -184,10 +184,14 @@ def create_producer_from_consumer(
         if not topic_settings:
             raise ValueError("topic_settings is required for Pub/Sub backend")
 
+        # Optional: embedding topic name from kwargs
+        embedding_topic_name = kwargs.get("embedding_topic_name")
+
         return PubSubProducer(
             pubsub_config=pubsub_config,
             topic_settings=topic_settings,
             publisher=consumer._publisher,
+            embedding_topic_name=embedding_topic_name,
         )
 
     else:
@@ -241,9 +245,13 @@ async def create_standalone_producer(
         if not topic_settings:
             raise ValueError("topic_settings is required for Pub/Sub backend")
 
+        # Optional: embedding topic name from kwargs
+        embedding_topic_name = kwargs.get("embedding_topic_name")
+
         producer = PubSubProducer(
             pubsub_config=pubsub_config,
             topic_settings=topic_settings,
+            embedding_topic_name=embedding_topic_name,
         )
         await producer.connect()
         return producer

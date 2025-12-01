@@ -227,6 +227,24 @@ class BaseProducer(ABC):
         """
         pass
 
+    @abstractmethod
+    async def publish_embedding(
+        self,
+        extraction_id: str,
+        force: bool = False,
+    ) -> PublishResult:
+        """
+        Publish an embedding generation job to the queue.
+
+        Args:
+            extraction_id: ID of the extraction to generate embeddings for
+            force: Force regeneration even if embedding already exists
+
+        Returns:
+            PublishResult with publish outcome
+        """
+        pass
+
     async def publish_batch(
         self,
         extraction_ids: list[str],
@@ -266,5 +284,51 @@ class BaseProducer(ABC):
 
         success_count = sum(1 for r in results.values() if r.success)
         logger.info(f"Published {success_count}/{len(extraction_ids)} extractions")
+
+        return results
+
+    async def publish_embedding_batch(
+        self,
+        extraction_ids: list[str],
+        max_concurrent: int = 10,
+        force: bool = False,
+    ) -> dict[str, PublishResult]:
+        """
+        Publish multiple embedding jobs with controlled concurrency.
+
+        Args:
+            extraction_ids: List of extraction IDs to publish
+            max_concurrent: Maximum concurrent publish operations
+            force: Force regeneration even if embeddings exist
+
+        Returns:
+            Dict mapping extraction_id to PublishResult
+        """
+        import asyncio
+        import logging
+
+        logger = logging.getLogger(__name__)
+        results: dict[str, PublishResult] = {}
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def publish_one(extraction_id: str) -> None:
+            async with semaphore:
+                try:
+                    results[extraction_id] = await self.publish_embedding(
+                        extraction_id, force=force
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to publish embedding {extraction_id}: {e}")
+                    results[extraction_id] = PublishResult(
+                        success=False,
+                        error=str(e),
+                    )
+
+        await asyncio.gather(*[publish_one(eid) for eid in extraction_ids])
+
+        success_count = sum(1 for r in results.values() if r.success)
+        logger.info(
+            f"Published {success_count}/{len(extraction_ids)} embedding jobs"
+        )
 
         return results

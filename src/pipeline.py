@@ -6,12 +6,14 @@ This module orchestrates the complete extraction workflow:
 2. Download and extract text from PDF
 3. Process through LLM extraction pipeline
 4. Save results to llm_extractions table
+5. Generate embeddings for AI Agent council
 """
 
 import logging
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from settings import get_settings
 from src.extraction import (
     ExtractionResult,
     ExtractionStatus,
@@ -63,7 +65,9 @@ async def run_extraction_pipeline(
         # Step 2: Download and extract text from PDF
         logger.info(f"Step 2: Reading PDF from {crawler_meta.artifact_link}")
         doc_content, max_page = await read_pdf_from_uri(crawler_meta.artifact_link)
-        logger.info(f"Extracted {len(doc_content)} pages from PDF (max page: {max_page})")
+        logger.info(
+            f"Extracted {len(doc_content)} pages from PDF (max page: {max_page})"
+        )
 
         # Update status to processing
         try:
@@ -95,6 +99,40 @@ async def run_extraction_pipeline(
             status=ExtractionStatus.COMPLETED,
         )
         logger.info(f"Saved LLM extraction for {decision_number}")
+
+        # Step 5: Generate embeddings for AI Agent council
+        settings = get_settings()
+        if settings.embedding_enabled:
+            logger.info("Step 5: Generating embeddings for semantic search")
+            try:
+                from src.embedding import (
+                    generate_all_embeddings,
+                    save_extraction_embeddings,
+                )
+
+                content_emb, summary_emb_id, summary_emb_en = (
+                    await generate_all_embeddings(
+                        extraction_result=extraction_result.model_dump(),
+                        summary_id=summary_id,
+                        summary_en=summary_en,
+                    )
+                )
+
+                await save_extraction_embeddings(
+                    db_engine=crawler_db_engine,
+                    extraction_id=extraction_id,
+                    content_embedding=content_emb,
+                    summary_embedding_id=summary_emb_id,
+                    summary_embedding_en=summary_emb_en,
+                )
+                logger.info(f"Generated embeddings for {decision_number}")
+            except Exception as emb_error:
+                # Don't fail the pipeline if embedding fails
+                logger.warning(
+                    f"Embedding generation failed for {decision_number}: {emb_error}"
+                )
+        else:
+            logger.info("Step 5: Skipping embedding generation (disabled)")
 
         logger.info(f"Extraction pipeline completed successfully for {decision_number}")
         return extraction_result, summary_id, summary_en, decision_number

@@ -133,7 +133,52 @@ class NatsProducer(BaseProducer):
 
         return result
 
-    # publish_batch is inherited from BaseProducer
+    async def publish_embedding(
+        self,
+        extraction_id: str,
+        force: bool = False,
+    ) -> PublishResult:
+        """
+        Publish an embedding generation job to the queue.
+
+        Uses extraction_id + force flag as message ID for deduplication.
+
+        Args:
+            extraction_id: ID of the extraction to generate embeddings for
+            force: Force regeneration even if embedding already exists
+
+        Returns:
+            PublishResult with publish outcome
+        """
+        payload = {
+            "extraction_id": extraction_id,
+            "force": force,
+        }
+
+        # Use extraction_id with suffix for deduplication
+        # Adding timestamp allows requeuing the same extraction
+        msg_id = f"emb-{extraction_id}-{force}"
+        headers = {"Nats-Msg-Id": msg_id}
+
+        result = await self.publish(
+            subject=QueueSubject.EMBEDDING.value,
+            payload=payload,
+            headers=headers,
+        )
+
+        if result.success:
+            logger.debug(
+                f"Published embedding {extraction_id} to stream={result.stream}, "
+                f"seq={result.sequence}"
+            )
+        else:
+            logger.error(
+                f"Failed to publish embedding {extraction_id}: {result.error}"
+            )
+
+        return result
+
+    # publish_batch and publish_embedding_batch are inherited from BaseProducer
 
 
 class ProducerFactory:

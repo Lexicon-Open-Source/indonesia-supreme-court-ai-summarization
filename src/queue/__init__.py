@@ -44,10 +44,12 @@ from .base import (
 from .config import (
     DEFAULT_CONSUMER_SETTINGS,
     DEFAULT_DEAD_LETTER_SETTINGS,
+    DEFAULT_EMBEDDING_CONSUMER_SETTINGS,
     DEFAULT_STREAM_SETTINGS,
     DEFAULT_WORKER_SETTINGS,
     ConsumerSettings,
     DeadLetterSettings,
+    EmbeddingConsumerSettings,
     NatsConfig,
     QueueSubject,
     StreamSettings,
@@ -72,6 +74,12 @@ from .errors import (
 from .extraction_handler import (
     ExtractionHandler,
     ExtractionPayload,
+)
+
+# Embedding Handler
+from .embedding_handler import (
+    EmbeddingHandler,
+    EmbeddingPayload,
 )
 
 # Factory functions
@@ -122,11 +130,13 @@ __all__ = [
     "NatsConfig",
     "StreamSettings",
     "ConsumerSettings",
+    "EmbeddingConsumerSettings",
     "DeadLetterSettings",
     "WorkerSettings",
     "QueueSubject",
     "DEFAULT_STREAM_SETTINGS",
     "DEFAULT_CONSUMER_SETTINGS",
+    "DEFAULT_EMBEDDING_CONSUMER_SETTINGS",
     "DEFAULT_DEAD_LETTER_SETTINGS",
     "DEFAULT_WORKER_SETTINGS",
     # NATS Implementation
@@ -158,4 +168,7 @@ __all__ = [
     # Extraction Handler
     "ExtractionHandler",
     "ExtractionPayload",
+    # Embedding Handler
+    "EmbeddingHandler",
+    "EmbeddingPayload",
 ]
