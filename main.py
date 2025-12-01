@@ -20,6 +20,7 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Query
 from fastapi.exceptions import HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from sqlalchemy import func, text
@@ -30,6 +31,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from settings import QueueBackendType, _temp_credentials_file, get_settings
 from src.council import council_router
+from src.council import create_tables as create_council_tables
 from src.council import set_db_engine as set_council_db_engine
 from src.embedding import (
     SearchResult,
@@ -561,9 +563,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     )
     logger.info("Stale record recovery task started")
 
-    # Initialize council feature with database engine
+    # Initialize council feature with database engine and create tables
     set_council_db_engine(app_state.crawler_db_engine)
-    logger.info("Virtual Judicial Council initialized")
+    await create_council_tables()
+    logger.info("Virtual Judicial Council initialized with database persistence")
 
     logger.info("Startup complete")
     yield
@@ -604,11 +607,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Configure CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://lexicon.id",
+        "http://localhost:3000",  # Local development
+        "http://localhost:3001", # Local development,
+    ],
+    allow_origin_regex=r"https://.*\.lexicon\.id",  # All subdomains of lexicon.id
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Include the Virtual Judicial Council router
 app.include_router(
     council_router,
     prefix="/council",
     tags=["Virtual Judicial Council"],
+    dependencies=[Depends(verify_api_key)],
 )
 
 

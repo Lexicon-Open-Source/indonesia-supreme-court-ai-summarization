@@ -18,7 +18,7 @@ from src.council.agents import (
     HumanistAgent,
     StrictConstructionistAgent,
 )
-from src.council.routers import council_router, set_db_engine
+from src.council.routers import council_router, create_tables, set_db_engine
 from src.council.schemas import (
     AgentId,
     CaseType,
@@ -33,6 +33,7 @@ __all__ = [
     # Router and setup
     "council_router",
     "set_db_engine",
+    "create_tables",
     # Agents
     "AgentOrchestrator",
     "StrictConstructionistAgent",

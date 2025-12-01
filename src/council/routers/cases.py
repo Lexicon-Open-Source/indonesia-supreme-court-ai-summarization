@@ -222,9 +222,7 @@ async def get_case_statistics(
         verdict_result = await session.execute(text(verdict_sql))
         verdict_rows = verdict_result.fetchall()
 
-        verdict_distribution = {
-            row.verdict_result: row.count for row in verdict_rows
-        }
+        verdict_distribution = {row.verdict_result: row.count for row in verdict_rows}
 
     return CaseStatisticsResponse(
         total_cases=total_cases,

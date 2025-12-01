@@ -341,6 +341,24 @@ class SendMessageResponse(BaseModel):
     agent_responses: list[DeliberationMessage]
 
 
+class ContinueDiscussionRequest(BaseModel):
+    """Request to continue the judicial discussion without user input."""
+
+    num_rounds: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description="Number of discussion rounds (each round = all judges respond)",
+    )
+
+
+class ContinueDiscussionResponse(BaseModel):
+    """Response after continuing the discussion."""
+
+    new_messages: list[DeliberationMessage]
+    total_messages: int
+
+
 class GetMessagesResponse(BaseModel):
     """Response for getting messages."""
 
@@ -416,3 +434,52 @@ class CaseStatisticsResponse(BaseModel):
     total_cases: int
     sentence_distribution: dict[str, Any]
     verdict_distribution: dict[str, Any]
+
+
+# =============================================================================
+# Streaming Schemas
+# =============================================================================
+
+
+class StreamEventType(str, Enum):
+    """Types of streaming events."""
+
+    AGENT_START = "agent_start"
+    CHUNK = "chunk"
+    AGENT_COMPLETE = "agent_complete"
+    AGENT_ERROR = "agent_error"
+    USER_MESSAGE = "user_message"
+    DELIBERATION_COMPLETE = "deliberation_complete"
+
+
+class StreamEventData(BaseModel):
+    """Data payload for streaming events (SSE)."""
+
+    event_type: StreamEventType
+    agent_id: AgentId | None = None
+    content: str = ""
+    message_id: str | None = None
+    full_content: str | None = None  # Only on agent_complete
+
+    class Config:
+        """Pydantic config."""
+
+        use_enum_values = True
+
+
+class StreamMessageRequest(BaseModel):
+    """Request for streaming message processing."""
+
+    content: str = Field(..., min_length=1, max_length=5000)
+    target_agent: str | None = None  # AgentId or "all"
+
+
+class StreamContinueRequest(BaseModel):
+    """Request for streaming continued discussion."""
+
+    num_rounds: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description="Number of discussion rounds (each round = all judges respond)",
+    )

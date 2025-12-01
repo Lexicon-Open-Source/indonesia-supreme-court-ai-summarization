@@ -13,6 +13,7 @@ import logging
 from fastapi import APIRouter
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from src.council.database import init_session_store
 from src.council.routers.cases import router as cases_router
 from src.council.routers.deliberation import router as deliberation_router
 from src.council.routers.sessions import router as sessions_router
@@ -49,11 +50,28 @@ def set_db_engine(engine: AsyncEngine) -> None:
     Set the database engine for all council routes.
 
     This must be called during app startup before any routes are used.
+    Also initializes the database-backed session store.
     """
     global _db_engine
     _db_engine = engine
     _set_sessions_db(engine)
-    logger.info("Council database engine configured")
+    # Initialize the database-backed session store
+    init_session_store(engine)
+    logger.info("Council database engine and session store configured")
 
 
-__all__ = ["council_router", "set_db_engine"]
+async def create_tables() -> None:
+    """
+    Create database tables for the council feature.
+
+    Must be called after set_db_engine() during app startup.
+    Creates deliberation_sessions and deliberation_messages tables.
+    """
+    from src.council.database import get_session_store
+
+    store = get_session_store()
+    await store.create_tables()
+    logger.info("Council database tables created/verified")
+
+
+__all__ = ["council_router", "set_db_engine", "create_tables"]

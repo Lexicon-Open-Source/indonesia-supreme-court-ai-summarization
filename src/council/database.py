@@ -2,7 +2,7 @@
 Database operations for the Virtual Judicial Council.
 
 Provides:
-- Session storage and retrieval (in-memory with optional persistence)
+- Session storage and retrieval with PostgreSQL persistence
 - Similar case search using pgvector embeddings
 - Case data access from llm_extractions table
 """
@@ -12,19 +12,27 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import text
+from sqlalchemy import TIMESTAMP, Column, Integer, Text, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
-from sqlmodel import select
+from sqlmodel import Field as SQLField
+from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.council.schemas import (
+    AgentId,
+    AgentSender,
     CaseInput,
     CaseRecord,
     CaseType,
     DeliberationMessage,
     DeliberationSession,
+    InputType,
+    ParsedCaseInput,
     SessionStatus,
     SimilarCase,
+    SystemSender,
+    UserSender,
 )
 from src.council.services.embeddings import (
     get_council_embedding_service,
@@ -34,20 +42,188 @@ from src.extraction import LLMExtraction
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# SQLModel Table Definitions
+# =============================================================================
+
+# Schema for all council tables
+COUNCIL_SCHEMA = "council_v1"
+
+
+class DeliberationSessionDB(SQLModel, table=True):
+    """SQLModel for deliberation_sessions table in council_v1 schema."""
+
+    __tablename__ = "deliberation_sessions"
+    __table_args__ = {"schema": COUNCIL_SCHEMA}
+
+    id: str = SQLField(primary_key=True)
+    user_id: str | None = SQLField(default=None, index=True)
+    status: str = SQLField(default=SessionStatus.ACTIVE.value, index=True)
+
+    # Complex nested data stored as JSONB
+    case_input: dict = SQLField(sa_column=Column(JSONB, nullable=False))
+    similar_cases: list = SQLField(
+        default_factory=list, sa_column=Column(JSONB, nullable=False)
+    )
+    legal_opinion: dict | None = SQLField(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
+
+    # Timestamps
+    created_at: datetime = SQLField(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(TIMESTAMP(timezone=True), nullable=False),
+    )
+    updated_at: datetime = SQLField(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(TIMESTAMP(timezone=True), nullable=False),
+    )
+    concluded_at: datetime | None = SQLField(
+        default=None,
+        sa_column=Column(TIMESTAMP(timezone=True), nullable=True),
+    )
+
+
+class DeliberationMessageDB(SQLModel, table=True):
+    """SQLModel for deliberation_messages table in council_v1 schema."""
+
+    __tablename__ = "deliberation_messages"
+    __table_args__ = {"schema": COUNCIL_SCHEMA}
+
+    id: str = SQLField(primary_key=True)
+    session_id: str = SQLField(
+        index=True, foreign_key=f"{COUNCIL_SCHEMA}.deliberation_sessions.id"
+    )
+
+    # Sender stored as JSONB to handle union type
+    sender: dict = SQLField(sa_column=Column(JSONB, nullable=False))
+    content: str = SQLField(sa_column=Column(Text, nullable=False))
+    intent: str | None = SQLField(default=None)
+
+    # Lists stored as JSONB
+    cited_cases: list = SQLField(
+        default_factory=list, sa_column=Column(JSONB, nullable=False)
+    )
+    cited_laws: list = SQLField(
+        default_factory=list, sa_column=Column(JSONB, nullable=False)
+    )
+
+    # Ordering and timestamp
+    sequence_number: int = SQLField(
+        sa_column=Column(Integer, nullable=False)
+    )
+    timestamp: datetime = SQLField(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(TIMESTAMP(timezone=True), nullable=False),
+    )
+
+
+# =============================================================================
+# Conversion Helpers
+# =============================================================================
+
+
+def _sender_to_dict(sender: UserSender | AgentSender | SystemSender) -> dict:
+    """Convert a MessageSender to a dictionary for JSONB storage."""
+    if isinstance(sender, AgentSender):
+        return {"type": "agent", "agent_id": sender.agent_id.value}
+    elif isinstance(sender, UserSender):
+        return {"type": "user"}
+    else:
+        return {"type": "system"}
+
+
+def _dict_to_sender(data: dict) -> UserSender | AgentSender | SystemSender:
+    """Convert a dictionary from JSONB to a MessageSender."""
+    sender_type = data.get("type")
+    if sender_type == "agent":
+        return AgentSender(agent_id=AgentId(data["agent_id"]))
+    elif sender_type == "user":
+        return UserSender()
+    else:
+        return SystemSender()
+
+
+def _db_session_to_schema(
+    db_session: DeliberationSessionDB,
+    messages: list[DeliberationMessageDB],
+) -> DeliberationSession:
+    """Convert database models to Pydantic schema."""
+    # Convert messages
+    schema_messages = [
+        DeliberationMessage(
+            id=msg.id,
+            session_id=msg.session_id,
+            sender=_dict_to_sender(msg.sender),
+            content=msg.content,
+            intent=msg.intent,
+            cited_cases=msg.cited_cases or [],
+            cited_laws=msg.cited_laws or [],
+            timestamp=msg.timestamp,
+        )
+        for msg in sorted(messages, key=lambda m: m.sequence_number)
+    ]
+
+    # Convert case_input from dict to CaseInput
+    case_input_dict = db_session.case_input
+    case_input = CaseInput(
+        input_type=InputType(case_input_dict["input_type"]),
+        raw_input=case_input_dict["raw_input"],
+        parsed_case=ParsedCaseInput.model_validate(case_input_dict["parsed_case"]),
+    )
+
+    # Convert similar_cases from list of dicts to list of SimilarCase
+    similar_cases = [
+        SimilarCase.model_validate(sc) for sc in (db_session.similar_cases or [])
+    ]
+
+    return DeliberationSession(
+        id=db_session.id,
+        user_id=db_session.user_id,
+        status=SessionStatus(db_session.status),
+        case_input=case_input,
+        similar_cases=similar_cases,
+        messages=schema_messages,
+        legal_opinion=db_session.legal_opinion,
+        created_at=db_session.created_at,
+        updated_at=db_session.updated_at,
+        concluded_at=db_session.concluded_at,
+    )
+
+
+# =============================================================================
+# Database Session Store
+# =============================================================================
+
+
 class SessionStore:
     """
-    In-memory store for deliberation sessions.
+    Database-backed store for deliberation sessions.
 
-    For production, this could be extended to persist sessions
-    to a database table.
+    Persists sessions and messages to PostgreSQL using SQLModel.
+    All methods are async to support database operations.
     """
 
-    def __init__(self):
-        """Initialize the session store."""
-        self._sessions: dict[str, DeliberationSession] = {}
-        logger.info("Session store initialized")
+    def __init__(self, db_engine: AsyncEngine):
+        """
+        Initialize the session store with a database engine.
 
-    def create_session(
+        Args:
+            db_engine: SQLAlchemy async engine for database operations
+        """
+        self._db_engine = db_engine
+        self._async_session = async_sessionmaker(
+            bind=db_engine, class_=AsyncSession, expire_on_commit=False
+        )
+        logger.info("Database session store initialized")
+
+    async def create_tables(self) -> None:
+        """Create database tables if they don't exist."""
+        async with self._db_engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        logger.info("Deliberation tables created/verified")
+
+    async def create_session(
         self,
         case_input: CaseInput,
         user_id: str | None = None,
@@ -63,8 +239,30 @@ class SessionStore:
             New DeliberationSession
         """
         now = datetime.now(timezone.utc)
-        session = DeliberationSession(
-            id=str(uuid4()),
+        session_id = str(uuid4())
+
+        # Create DB model
+        db_session = DeliberationSessionDB(
+            id=session_id,
+            user_id=user_id,
+            status=SessionStatus.ACTIVE.value,
+            case_input=case_input.model_dump(mode="json"),
+            similar_cases=[],
+            legal_opinion=None,
+            created_at=now,
+            updated_at=now,
+        )
+
+        async with self._async_session() as session:
+            session.add(db_session)
+            await session.commit()
+            await session.refresh(db_session)
+
+        logger.info(f"Created session: {session_id}")
+
+        # Return as Pydantic schema
+        return DeliberationSession(
+            id=session_id,
             user_id=user_id,
             status=SessionStatus.ACTIVE,
             case_input=case_input,
@@ -73,69 +271,197 @@ class SessionStore:
             created_at=now,
             updated_at=now,
         )
-        self._sessions[session.id] = session
-        logger.info(f"Created session: {session.id}")
-        return session
 
-    def get_session(self, session_id: str) -> DeliberationSession | None:
-        """Get a session by ID."""
-        return self._sessions.get(session_id)
+    async def get_session(self, session_id: str) -> DeliberationSession | None:
+        """Get a session by ID with all its messages."""
+        async with self._async_session() as session:
+            # Get session
+            result = await session.execute(
+                select(DeliberationSessionDB).where(
+                    DeliberationSessionDB.id == session_id
+                )
+            )
+            db_session = result.scalar_one_or_none()
 
-    def update_session(self, session: DeliberationSession) -> None:
-        """Update a session in the store."""
-        session.updated_at = datetime.now(timezone.utc)
-        self._sessions[session.id] = session
-        logger.debug(f"Updated session: {session.id}")
+            if not db_session:
+                return None
 
-    def add_message(
+            # Get messages
+            msg_result = await session.execute(
+                select(DeliberationMessageDB)
+                .where(DeliberationMessageDB.session_id == session_id)
+                .order_by(DeliberationMessageDB.sequence_number)
+            )
+            messages = list(msg_result.scalars().all())
+
+        return _db_session_to_schema(db_session, messages)
+
+    async def update_session(self, session: DeliberationSession) -> None:
+        """Update a session in the database."""
+        async with self._async_session() as db_session:
+            result = await db_session.execute(
+                select(DeliberationSessionDB).where(
+                    DeliberationSessionDB.id == session.id
+                )
+            )
+            db_record = result.scalar_one_or_none()
+
+            if db_record:
+                db_record.status = session.status.value
+                db_record.case_input = session.case_input.model_dump(mode="json")
+                db_record.similar_cases = [
+                    sc.model_dump(mode="json") for sc in session.similar_cases
+                ]
+                db_record.legal_opinion = session.legal_opinion
+                db_record.updated_at = datetime.now(timezone.utc)
+                db_record.concluded_at = session.concluded_at
+
+                await db_session.commit()
+                logger.debug(f"Updated session: {session.id}")
+
+    async def add_message(
         self,
         session_id: str,
         message: DeliberationMessage,
     ) -> DeliberationSession | None:
         """Add a message to a session."""
-        session = self._sessions.get(session_id)
-        if session:
-            session.messages.append(message)
-            session.updated_at = datetime.now(timezone.utc)
-            return session
-        return None
+        async with self._async_session() as session:
+            # Verify session exists
+            result = await session.execute(
+                select(DeliberationSessionDB).where(
+                    DeliberationSessionDB.id == session_id
+                )
+            )
+            db_session = result.scalar_one_or_none()
 
-    def add_messages(
+            if not db_session:
+                return None
+
+            # Get current message count for sequence number
+            count_result = await session.execute(
+                select(DeliberationMessageDB)
+                .where(DeliberationMessageDB.session_id == session_id)
+            )
+            current_count = len(list(count_result.scalars().all()))
+
+            # Create message
+            db_message = DeliberationMessageDB(
+                id=message.id,
+                session_id=session_id,
+                sender=_sender_to_dict(message.sender),
+                content=message.content,
+                intent=message.intent,
+                cited_cases=message.cited_cases,
+                cited_laws=message.cited_laws,
+                sequence_number=current_count,
+                timestamp=message.timestamp or datetime.now(timezone.utc),
+            )
+
+            session.add(db_message)
+
+            # Update session timestamp
+            db_session.updated_at = datetime.now(timezone.utc)
+
+            await session.commit()
+
+        return await self.get_session(session_id)
+
+    async def add_messages(
         self,
         session_id: str,
         messages: list[DeliberationMessage],
     ) -> DeliberationSession | None:
         """Add multiple messages to a session."""
-        session = self._sessions.get(session_id)
-        if session:
-            session.messages.extend(messages)
-            session.updated_at = datetime.now(timezone.utc)
-            return session
-        return None
+        if not messages:
+            return await self.get_session(session_id)
 
-    def set_similar_cases(
+        async with self._async_session() as session:
+            # Verify session exists
+            result = await session.execute(
+                select(DeliberationSessionDB).where(
+                    DeliberationSessionDB.id == session_id
+                )
+            )
+            db_session = result.scalar_one_or_none()
+
+            if not db_session:
+                return None
+
+            # Get current message count for sequence numbers
+            count_result = await session.execute(
+                select(DeliberationMessageDB)
+                .where(DeliberationMessageDB.session_id == session_id)
+            )
+            current_count = len(list(count_result.scalars().all()))
+
+            # Create all messages
+            for i, message in enumerate(messages):
+                db_message = DeliberationMessageDB(
+                    id=message.id,
+                    session_id=session_id,
+                    sender=_sender_to_dict(message.sender),
+                    content=message.content,
+                    intent=message.intent,
+                    cited_cases=message.cited_cases,
+                    cited_laws=message.cited_laws,
+                    sequence_number=current_count + i,
+                    timestamp=message.timestamp or datetime.now(timezone.utc),
+                )
+                session.add(db_message)
+
+            # Update session timestamp
+            db_session.updated_at = datetime.now(timezone.utc)
+
+            await session.commit()
+
+        return await self.get_session(session_id)
+
+    async def set_similar_cases(
         self,
         session_id: str,
         similar_cases: list[SimilarCase],
     ) -> None:
         """Set similar cases for a session."""
-        session = self._sessions.get(session_id)
-        if session:
-            session.similar_cases = similar_cases
-            session.updated_at = datetime.now(timezone.utc)
+        async with self._async_session() as session:
+            result = await session.execute(
+                select(DeliberationSessionDB).where(
+                    DeliberationSessionDB.id == session_id
+                )
+            )
+            db_session = result.scalar_one_or_none()
 
-    def conclude_session(self, session_id: str) -> DeliberationSession | None:
+            if db_session:
+                db_session.similar_cases = [
+                    sc.model_dump(mode="json") for sc in similar_cases
+                ]
+                db_session.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+
+    async def conclude_session(
+        self, session_id: str
+    ) -> DeliberationSession | None:
         """Mark a session as concluded."""
-        session = self._sessions.get(session_id)
-        if session:
-            now = datetime.now(timezone.utc)
-            session.status = SessionStatus.CONCLUDED
-            session.concluded_at = now
-            session.updated_at = now
-            return session
-        return None
+        async with self._async_session() as session:
+            result = await session.execute(
+                select(DeliberationSessionDB).where(
+                    DeliberationSessionDB.id == session_id
+                )
+            )
+            db_session = result.scalar_one_or_none()
 
-    def list_sessions(
+            if not db_session:
+                return None
+
+            now = datetime.now(timezone.utc)
+            db_session.status = SessionStatus.CONCLUDED.value
+            db_session.concluded_at = now
+            db_session.updated_at = now
+
+            await session.commit()
+
+        return await self.get_session(session_id)
+
+    async def list_sessions(
         self,
         user_id: str | None = None,
         status: SessionStatus | None = None,
@@ -143,29 +469,84 @@ class SessionStore:
         offset: int = 0,
     ) -> list[DeliberationSession]:
         """List sessions with optional filtering."""
-        sessions = list(self._sessions.values())
+        async with self._async_session() as session:
+            query = select(DeliberationSessionDB)
 
-        # Filter by user
-        if user_id:
-            sessions = [s for s in sessions if s.user_id == user_id]
+            # Apply filters
+            if user_id:
+                query = query.where(DeliberationSessionDB.user_id == user_id)
+            if status:
+                query = query.where(DeliberationSessionDB.status == status.value)
 
-        # Filter by status
-        if status:
-            sessions = [s for s in sessions if s.status == status]
+            # Order by created_at descending
+            query = query.order_by(DeliberationSessionDB.created_at.desc())
 
-        # Sort by created_at descending
-        sessions.sort(key=lambda s: s.created_at, reverse=True)
+            # Apply pagination
+            query = query.offset(offset).limit(limit)
 
-        # Paginate
-        return sessions[offset : offset + limit]
+            result = await session.execute(query)
+            db_sessions = list(result.scalars().all())
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a session."""
-        if session_id in self._sessions:
-            del self._sessions[session_id]
-            logger.info(f"Deleted session: {session_id}")
-            return True
-        return False
+        # Convert to schemas (without messages for listing)
+        sessions = []
+        for db_session in db_sessions:
+            # For listing, we don't load all messages - just get the session
+            async with self._async_session() as session:
+                msg_result = await session.execute(
+                    select(DeliberationMessageDB)
+                    .where(DeliberationMessageDB.session_id == db_session.id)
+                    .order_by(DeliberationMessageDB.sequence_number)
+                )
+                messages = list(msg_result.scalars().all())
+
+            sessions.append(_db_session_to_schema(db_session, messages))
+
+        return sessions
+
+    async def count_sessions(
+        self,
+        user_id: str | None = None,
+        status: SessionStatus | None = None,
+    ) -> int:
+        """Count sessions with optional filtering."""
+        async with self._async_session() as session:
+            query = select(DeliberationSessionDB)
+
+            if user_id:
+                query = query.where(DeliberationSessionDB.user_id == user_id)
+            if status:
+                query = query.where(DeliberationSessionDB.status == status.value)
+
+            result = await session.execute(query)
+            return len(list(result.scalars().all()))
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete a session and all its messages."""
+        async with self._async_session() as session:
+            # Delete messages first (or rely on CASCADE)
+            await session.execute(
+                text(
+                    f"DELETE FROM {COUNCIL_SCHEMA}.deliberation_messages "
+                    "WHERE session_id = :session_id"
+                ),
+                {"session_id": session_id},
+            )
+
+            # Delete session
+            result = await session.execute(
+                select(DeliberationSessionDB).where(
+                    DeliberationSessionDB.id == session_id
+                )
+            )
+            db_session = result.scalar_one_or_none()
+
+            if db_session:
+                await session.delete(db_session)
+                await session.commit()
+                logger.info(f"Deleted session: {session_id}")
+                return True
+
+            return False
 
 
 class CaseDatabase:
@@ -220,9 +601,7 @@ class CaseDatabase:
             return []
 
         # Search using pgvector
-        async_session = async_sessionmaker(
-            bind=self.db_engine, class_=AsyncSession
-        )
+        async_session = async_sessionmaker(bind=self.db_engine, class_=AsyncSession)
 
         query_vector = f"[{','.join(str(x) for x in query_embedding)}]"
 
@@ -322,9 +701,7 @@ class CaseDatabase:
         Returns:
             CaseRecord or None if not found
         """
-        async_session = async_sessionmaker(
-            bind=self.db_engine, class_=AsyncSession
-        )
+        async_session = async_sessionmaker(bind=self.db_engine, class_=AsyncSession)
 
         async with async_session() as session:
             result = await session.execute(
@@ -377,9 +754,7 @@ class CaseDatabase:
             logger.warning("Failed to generate query embedding for search")
             return []
 
-        async_session = async_sessionmaker(
-            bind=self.db_engine, class_=AsyncSession
-        )
+        async_session = async_sessionmaker(bind=self.db_engine, class_=AsyncSession)
 
         query_vector = f"[{','.join(str(x) for x in query_embedding)}]"
 
@@ -432,9 +807,7 @@ class CaseDatabase:
         filters: dict[str, Any] | None = None,
     ) -> list[CaseRecord]:
         """Perform text-based search on summaries."""
-        async_session = async_sessionmaker(
-            bind=self.db_engine, class_=AsyncSession
-        )
+        async_session = async_sessionmaker(bind=self.db_engine, class_=AsyncSession)
 
         async with async_session() as session:
             sql = """
@@ -487,9 +860,7 @@ class CaseDatabase:
 
         # Determine case type
         crime_category = (
-            case_meta.get("crime_category")
-            or result.get("crime_category")
-            or ""
+            case_meta.get("crime_category") or result.get("crime_category") or ""
         ).lower()
 
         if "narkotika" in crime_category or "narcotics" in crime_category:
@@ -540,9 +911,7 @@ class CaseDatabase:
 
             # Determine case type
             crime_category = (
-                case_meta.get("crime_category")
-                or result.get("crime_category")
-                or ""
+                case_meta.get("crime_category") or result.get("crime_category") or ""
             ).lower()
 
             if "narkotika" in crime_category or "narcotics" in crime_category:
@@ -600,9 +969,34 @@ class CaseDatabase:
 _session_store: SessionStore | None = None
 
 
+def init_session_store(db_engine: AsyncEngine) -> SessionStore:
+    """
+    Initialize the session store singleton with a database engine.
+
+    Must be called once at application startup before using get_session_store().
+
+    Args:
+        db_engine: SQLAlchemy async engine for database operations
+
+    Returns:
+        The initialized SessionStore instance
+    """
+    global _session_store
+    _session_store = SessionStore(db_engine)
+    logger.info("Session store initialized with database engine")
+    return _session_store
+
+
 def get_session_store() -> SessionStore:
-    """Get or create the session store singleton."""
+    """
+    Get the session store singleton.
+
+    Raises:
+        RuntimeError: If init_session_store() hasn't been called yet
+    """
     global _session_store
     if _session_store is None:
-        _session_store = SessionStore()
+        raise RuntimeError(
+            "Session store not initialized. Call init_session_store() first."
+        )
     return _session_store

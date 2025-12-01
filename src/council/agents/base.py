@@ -11,6 +11,8 @@ Provides the foundation for specialized judicial AI agents with:
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from uuid import uuid4
 
 from litellm import acompletion
@@ -24,6 +26,16 @@ from src.council.schemas import (
     ParsedCaseInput,
     SimilarCase,
 )
+
+
+@dataclass
+class StreamChunk:
+    """A chunk of streamed response from an agent."""
+
+    agent_id: AgentId
+    content: str
+    is_complete: bool = False
+    message_id: str | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -74,29 +86,47 @@ class BaseJudgeAgent(ABC):
 
         Combines the agent-specific philosophy with common formatting rules.
         """
-        return f"""You are a judicial AI assistant participating in a deliberation council.
+        return f"""Anda adalah hakim yang berpartisipasi dalam musyawarah majelis hakim dengan dua hakim lainnya.
+
+PENTING: SELALU GUNAKAN BAHASA INDONESIA dalam semua respons Anda. Jangan menggunakan bahasa Inggris.
 
 {self.system_prompt}
 
-RESPONSE GUIDELINES:
-1. Keep responses focused and concise (200-400 words typically)
-2. Reference specific legal articles when relevant (e.g., "Article 127 UU Narkotika")
-3. Cite similar cases when applicable using case numbers
-4. Acknowledge but respectfully disagree with other judges when your philosophy differs
-5. Use formal but accessible language
-6. Structure longer responses with clear sections
+GAYA MUSYAWARAH:
+Anda sedang dalam diskusi LANGSUNG dengan sesama hakim. Ini bukan pendapat formal tertulis - ini adalah musyawarah kerja di mana Anda memikirkan perkara bersama-sama.
 
-CITATION FORMAT:
-- When citing cases: "In case [CASE_NUMBER], the court held that..."
-- When citing laws: "Under Article X of [LAW_NAME]..."
-- Always explain how citations apply to the current case
+CARA BERINTERAKSI DENGAN HAKIM LAIN:
+1. SAPA mereka langsung dengan gelar (misalnya, "Rekan Hakim Humanis yang terhormat...")
+2. TANGGAPI poin-poin spesifik mereka - setuju, tidak setuju, atau kembangkan
+3. AJUKAN pertanyaan retoris untuk menguji penalaran mereka
+4. AKUI poin yang valid meskipun Anda tidak setuju secara keseluruhan
+5. TANTANG penalaran yang menurut Anda cacat, bukan orangnya
+6. CARI titik temu bila memungkinkan
 
-RESPONSE FORMAT:
-Provide your response as a thoughtful judicial opinion. Include:
-- Your position on the legal question
-- Legal reasoning with citations
-- How this aligns with your judicial philosophy
-- Any points of agreement or disagreement with other judges
+POLA DISKUSI NATURAL:
+- "Saya harus dengan hormat tidak setuju dengan Hakim Humanis dalam hal ini..."
+- "Hakim Sejarawan mengangkat preseden penting, tetapi saya akan membedakannya karena..."
+- "Meskipun saya menghargai penekanan Hakim Strict pada teks undang-undang, kita juga harus mempertimbangkan..."
+- "Saya sebagian setuju dengan rekan-rekan saya, tetapi..."
+- "Ini membawa saya untuk mempertanyakan asumsi bahwa..."
+
+PANDUAN RESPONS:
+1. Jaga agar respons tetap percakapan dan fokus (150-350 kata)
+2. Referensikan pasal undang-undang yang relevan (misalnya, "Pasal 127 UU Narkotika")
+3. Kutip kasus serupa bila berlaku
+4. Terlibat langsung dengan apa yang dikatakan hakim lain
+5. Tunjukkan proses penalaran Anda, bukan hanya kesimpulan
+
+FORMAT KUTIPAN:
+- Saat mengutip kasus: "Dalam perkara [NOMOR PERKARA], pengadilan memutuskan bahwa..."
+- Saat mengutip undang-undang: "Berdasarkan Pasal X [NAMA UU]..."
+- Kutipan singkat sudah cukup dalam diskusi - simpan analisis detail untuk pendapat formal
+
+HINDARI:
+- Berbicara seolah-olah Anda menulis putusan formal
+- Mengabaikan apa yang dikatakan hakim lain
+- Mengulangi poin yang sudah dibuat
+- Bersikap terlalu konfrontatif
 """
 
     def _extract_citations(self, content: str) -> tuple[list[str], list[str]]:
@@ -156,20 +186,20 @@ Provide your response as a thoughtful judicial opinion. Include:
         Returns:
             List of messages for the LLM
         """
-        messages = [
-            {"role": "system", "content": self.get_base_system_prompt()}
-        ]
+        messages = [{"role": "system", "content": self.get_base_system_prompt()}]
 
         # Add case context
         case_context = self._format_case_context(case_input, similar_cases)
         messages.append({"role": "user", "content": case_context})
-        messages.append({
-            "role": "assistant",
-            "content": "I understand the case details. I'm ready to deliberate.",
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "I understand the case details. I'm ready to deliberate.",
+            }
+        )
 
         # Add conversation history (limited to prevent context overflow)
-        recent_history = history[-self.max_context_messages:]
+        recent_history = history[-self.max_context_messages :]
         for msg in recent_history:
             role = self._get_role_for_message(msg)
             content = self._format_history_message(msg)
@@ -314,6 +344,94 @@ Provide your response as a thoughtful judicial opinion. Include:
             logger.error(f"Agent {self.agent_id.value} failed to respond: {e}")
             raise
 
+    async def generate_response_stream(
+        self,
+        session_id: str,
+        case_input: ParsedCaseInput,
+        similar_cases: list[SimilarCase],
+        history: list[DeliberationMessage],
+        user_message: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """
+        Generate a streaming response in the deliberation.
+
+        Yields chunks of the response as they are generated, enabling
+        real-time streaming to clients.
+
+        Args:
+            session_id: Current session ID
+            case_input: Parsed case information
+            similar_cases: Similar cases for reference
+            history: Previous deliberation messages
+            user_message: Optional new user message to respond to
+
+        Yields:
+            StreamChunk objects with partial content and completion status
+        """
+        messages = self._build_context(
+            case_input=case_input,
+            similar_cases=similar_cases,
+            history=history,
+            user_message=user_message,
+        )
+
+        message_id = str(uuid4())
+        logger.info(f"Agent {self.agent_id.value} generating streaming response")
+
+        full_content = ""
+
+        try:
+            response = await acompletion(
+                model=self.model,
+                messages=messages,
+                stream=True,
+            )
+
+            async for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content_chunk = chunk.choices[0].delta.content
+                    full_content += content_chunk
+                    yield StreamChunk(
+                        agent_id=self.agent_id,
+                        content=content_chunk,
+                        is_complete=False,
+                        message_id=message_id,
+                    )
+
+            # Final chunk with completion flag
+            yield StreamChunk(
+                agent_id=self.agent_id,
+                content="",
+                is_complete=True,
+                message_id=message_id,
+            )
+
+        except Exception as e:
+            logger.error(f"Agent {self.agent_id.value} streaming failed: {e}")
+            raise
+
+    def create_message_from_stream(
+        self,
+        session_id: str,
+        message_id: str,
+        full_content: str,
+    ) -> DeliberationMessage:
+        """
+        Create a DeliberationMessage from accumulated stream content.
+
+        Called after streaming completes to create the final message record.
+        """
+        cited_cases, cited_laws = self._extract_citations(full_content)
+
+        return DeliberationMessage(
+            id=message_id,
+            session_id=session_id,
+            sender=AgentSender(agent_id=self.agent_id),
+            content=full_content,
+            cited_cases=cited_cases,
+            cited_laws=cited_laws,
+        )
+
     async def generate_initial_opinion(
         self,
         session_id: str,
@@ -323,7 +441,7 @@ Provide your response as a thoughtful judicial opinion. Include:
         """
         Generate the agent's initial opinion on a new case.
 
-        Called when a new deliberation session starts.
+        Called when this agent opens the deliberation (typically Judge Strict).
 
         Args:
             session_id: New session ID
@@ -334,13 +452,15 @@ Provide your response as a thoughtful judicial opinion. Include:
             DeliberationMessage with initial opinion
         """
         initial_prompt = (
-            "Please provide your initial assessment of this case from your "
-            f"judicial perspective as a {self.agent_name}. "
-            "Include:\n"
-            "1. Your preliminary view on the appropriate verdict\n"
-            "2. Key legal considerations from your perspective\n"
-            "3. Relevant precedents you find applicable\n"
-            "4. Any initial concerns or points for further discussion"
+            "Anda membuka musyawarah majelis hakim ini. Sampaikan penilaian "
+            f"awal Anda dari perspektif sebagai {self.agent_name}.\n\n"
+            "Pernyataan pembuka Anda harus:\n"
+            "1. Merumuskan pertanyaan hukum utama di hadapan majelis\n"
+            "2. Menyatakan posisi awal Anda mengenai putusan\n"
+            "3. Mengidentifikasi pertimbangan hukum terpenting\n"
+            "4. Mengundang diskusi dari rekan hakim mengenai poin-poin tertentu\n\n"
+            "Berbicara secara alami seolah-olah menyapa majelis secara langsung. "
+            "Akhiri dengan pertanyaan atau poin yang mengundang tanggapan dari rekan hakim."
         )
 
         return await self.generate_response(
@@ -350,3 +470,93 @@ Provide your response as a thoughtful judicial opinion. Include:
             history=[],
             user_message=initial_prompt,
         )
+
+    async def respond_to_deliberation(
+        self,
+        session_id: str,
+        case_input: ParsedCaseInput,
+        similar_cases: list[SimilarCase],
+        prior_opinions: list[DeliberationMessage],
+        is_initial_round: bool = False,
+    ) -> DeliberationMessage:
+        """
+        Respond to the ongoing deliberation, engaging with other judges' opinions.
+
+        Args:
+            session_id: Current session ID
+            case_input: Parsed case information
+            similar_cases: Similar cases for reference
+            prior_opinions: Previous messages in the deliberation
+            is_initial_round: Whether this is the initial opinion round
+
+        Returns:
+            DeliberationMessage with response to the discussion
+        """
+        # Build context about what other judges have said
+        other_opinions = self._summarize_prior_opinions(prior_opinions)
+
+        if is_initial_round:
+            prompt = (
+                f"Musyawarah telah dimulai. Berikut pendapat rekan-rekan hakim Anda:\n\n"
+                f"{other_opinions}\n\n"
+                f"Sebagai {self.agent_name}, tanggapi diskusi ini:\n"
+                "1. Akui poin-poin spesifik yang dikemukakan rekan hakim (setuju atau tidak setuju)\n"
+                "2. Tambahkan perspektif unik Anda berdasarkan filosofi yudisial Anda\n"
+                "3. Tunjukkan hal-hal yang mungkin terlewatkan oleh rekan hakim lain\n"
+                "4. Jika Anda tidak setuju dengan hakim lain, jelaskan alasannya dengan hormat\n"
+                "5. Ajukan pertimbangan baru atau pertanyaan untuk diskusi lebih lanjut\n\n"
+                "Sapa rekan-rekan Anda secara langsung dan terlibat dengan penalaran mereka."
+            )
+        else:
+            prompt = (
+                f"Diskusi berlanjut. Musyawarah terkini:\n\n"
+                f"{other_opinions}\n\n"
+                f"Sebagai {self.agent_name}, berkontribusi pada diskusi yang sedang berlangsung:\n"
+                "- Tanggapi poin-poin baru yang diangkat oleh rekan hakim lain\n"
+                "- Bangun di atas area kesepakatan yang mulai terbentuk\n"
+                "- Klarifikasi atau pertahankan posisi Anda jika ditantang\n"
+                "- Arahkan diskusi menuju penyelesaian jika memungkinkan\n\n"
+                "Jaga agar tanggapan Anda tetap fokus untuk memajukan musyawarah."
+            )
+
+        return await self.generate_response(
+            session_id=session_id,
+            case_input=case_input,
+            similar_cases=similar_cases,
+            history=prior_opinions,
+            user_message=prompt,
+        )
+
+    def _summarize_prior_opinions(
+        self,
+        messages: list[DeliberationMessage],
+    ) -> str:
+        """
+        Create a summary of prior opinions for context.
+
+        Args:
+            messages: Previous deliberation messages
+
+        Returns:
+            Formatted summary string
+        """
+        summaries = []
+
+        for msg in messages:
+            if hasattr(msg.sender, "agent_id"):
+                agent_name = self._get_judge_title(msg.sender.agent_id)
+                # Include full content for richer context
+                summaries.append(f"**{agent_name}:**\n{msg.content}")
+            elif hasattr(msg.sender, "type") and msg.sender.type == "user":
+                summaries.append(f"**User:**\n{msg.content}")
+
+        return "\n\n---\n\n".join(summaries) if summaries else "No prior discussion."
+
+    def _get_judge_title(self, agent_id: AgentId) -> str:
+        """Get a formal title for a judge agent."""
+        titles = {
+            AgentId.STRICT: "Judge Strict (Constructionist)",
+            AgentId.HUMANIST: "Judge Humanist (Rehabilitative)",
+            AgentId.HISTORIAN: "Judge Historian (Precedent)",
+        }
+        return titles.get(agent_id, f"Judge {agent_id.value.title()}")

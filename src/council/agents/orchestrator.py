@@ -8,9 +8,11 @@ Coordinates the three judge agents to produce coherent deliberations:
 - Ensures balanced participation
 """
 
-import asyncio
 import logging
+import random
 import re
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from uuid import uuid4
 
 from src.council.agents.base import BaseJudgeAgent
@@ -25,6 +27,17 @@ from src.council.schemas import (
     SimilarCase,
     UserSender,
 )
+
+
+@dataclass
+class StreamEvent:
+    """Event emitted during streaming deliberation."""
+
+    event_type: str  # "agent_start", "chunk", "agent_complete", "deliberation_complete"
+    agent_id: AgentId | None = None
+    content: str = ""
+    message_id: str | None = None
+    full_content: str | None = None  # Only on agent_complete
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +220,12 @@ class AgentOrchestrator:
         """
         Generate initial opinions from all agents for a new session.
 
-        Agents respond in parallel for efficiency.
+        Agents respond sequentially to create a natural discussion flow:
+        1. Strict judge opens with legal framework analysis
+        2. Humanist judge responds with individual circumstances perspective
+        3. Historian judge synthesizes with precedent context
+
+        Each judge sees what previous judges said and can respond to them.
 
         Args:
             session_id: New session ID
@@ -219,27 +237,168 @@ class AgentOrchestrator:
         """
         logger.info(f"Generating initial opinions for session {session_id}")
 
-        # Generate in parallel
-        tasks = [
-            self.agents[agent_id].generate_initial_opinion(
-                session_id=session_id,
-                case_input=case_input,
-                similar_cases=similar_cases,
-            )
-            for agent_id in [AgentId.STRICT, AgentId.HUMANIST, AgentId.HISTORIAN]
-        ]
+        messages: list[DeliberationMessage] = []
+        deliberation_order = [AgentId.STRICT, AgentId.HUMANIST, AgentId.HISTORIAN]
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Generate opinions sequentially so each judge can respond to previous ones
+        for i, agent_id in enumerate(deliberation_order):
+            agent = self.agents[agent_id]
 
-        messages = []
-        for i, result in enumerate(results):
-            agent_id = list(AgentId)[i]
-            if isinstance(result, Exception):
-                logger.error(f"Agent {agent_id.value} failed to generate opinion: {result}")
+            try:
+                if i == 0:
+                    # First judge opens the deliberation
+                    response = await agent.generate_initial_opinion(
+                        session_id=session_id,
+                        case_input=case_input,
+                        similar_cases=similar_cases,
+                    )
+                else:
+                    # Subsequent judges respond to the discussion so far
+                    response = await agent.respond_to_deliberation(
+                        session_id=session_id,
+                        case_input=case_input,
+                        similar_cases=similar_cases,
+                        prior_opinions=messages,
+                        is_initial_round=True,
+                    )
+
+                messages.append(response)
+
+            except Exception as e:
+                logger.error(f"Agent {agent_id.value} failed to generate opinion: {e}")
                 continue
-            messages.append(result)
 
         return messages
+
+    async def generate_random_initial_opinion(
+        self,
+        session_id: str,
+        case_input: ParsedCaseInput,
+        similar_cases: list[SimilarCase],
+    ) -> DeliberationMessage:
+        """
+        Generate an initial opinion from a randomly selected judge.
+
+        This provides variety in who opens the deliberation and makes
+        session creation faster by only calling one LLM.
+
+        Args:
+            session_id: New session ID
+            case_input: Parsed case information
+            similar_cases: Similar cases for reference
+
+        Returns:
+            Initial opinion message from a randomly selected judge
+        """
+        # Randomly select one judge to open the deliberation
+        agent_id = random.choice(list(AgentId))
+        agent = self.agents[agent_id]
+
+        logger.info(
+            f"Generating random initial opinion for session {session_id} "
+            f"from {agent_id.value}"
+        )
+
+        response = await agent.generate_initial_opinion(
+            session_id=session_id,
+            case_input=case_input,
+            similar_cases=similar_cases,
+        )
+
+        return response
+
+    async def continue_discussion(
+        self,
+        session_id: str,
+        case_input: ParsedCaseInput,
+        similar_cases: list[SimilarCase],
+        history: list[DeliberationMessage],
+        num_rounds: int = 1,
+    ) -> list[DeliberationMessage]:
+        """
+        Continue the judicial discussion without user input.
+
+        Allows judges to respond to each other organically, creating
+        a more natural deliberation flow where they debate, challenge,
+        and build consensus.
+
+        Args:
+            session_id: Current session ID
+            case_input: Parsed case information
+            similar_cases: Similar cases for reference
+            history: Full message history so far
+            num_rounds: Number of discussion rounds (each round = all judges)
+
+        Returns:
+            New messages from the continued discussion
+        """
+        logger.info(
+            f"Continuing discussion for session {session_id}, {num_rounds} round(s)"
+        )
+
+        new_messages: list[DeliberationMessage] = []
+        current_history = list(history)
+
+        for round_num in range(num_rounds):
+            # Determine who should speak next based on balance and recent activity
+            speaker_order = self._get_discussion_order(current_history)
+
+            for agent_id in speaker_order:
+                agent = self.agents[agent_id]
+
+                try:
+                    response = await agent.respond_to_deliberation(
+                        session_id=session_id,
+                        case_input=case_input,
+                        similar_cases=similar_cases,
+                        prior_opinions=current_history,
+                        is_initial_round=False,
+                    )
+
+                    new_messages.append(response)
+                    current_history.append(response)
+
+                except Exception as e:
+                    logger.error(
+                        f"Agent {agent_id.value} failed in discussion round "
+                        f"{round_num + 1}: {e}"
+                    )
+                    continue
+
+        return new_messages
+
+    def _get_discussion_order(
+        self,
+        history: list[DeliberationMessage],
+    ) -> list[AgentId]:
+        """
+        Determine the order of speakers for the next discussion round.
+
+        Factors:
+        - Who spoke least recently
+        - Balance of participation
+        - Natural conversation flow (responder should go after challenged party)
+        """
+        # Find the last agent who spoke
+        last_speaker = self._get_last_agent(history)
+
+        # Start with the judges who haven't spoken most recently
+        participation = {agent_id: 0 for agent_id in AgentId}
+        recent = history[-6:] if len(history) > 6 else history
+
+        for msg in recent:
+            if hasattr(msg.sender, "agent_id"):
+                participation[msg.sender.agent_id] += 1
+
+        # Sort by least participation, but ensure variety
+        sorted_agents = sorted(participation.keys(), key=lambda a: participation[a])
+
+        # If last speaker exists, move them to respond last (they can rebut)
+        if last_speaker and last_speaker in sorted_agents:
+            sorted_agents.remove(last_speaker)
+            sorted_agents.append(last_speaker)
+
+        return sorted_agents
 
     async def process_user_message(
         self,
@@ -318,6 +477,345 @@ class AgentOrchestrator:
                 current_history = current_history + [response]
 
             return user_msg, responses
+
+    # =========================================================================
+    # Streaming Methods
+    # =========================================================================
+
+    async def generate_initial_opinions_stream(
+        self,
+        session_id: str,
+        case_input: ParsedCaseInput,
+        similar_cases: list[SimilarCase],
+    ) -> AsyncIterator[StreamEvent]:
+        """
+        Generate initial opinions with streaming responses.
+
+        Yields StreamEvents as each judge generates their opinion,
+        allowing real-time display of the deliberation.
+
+        Args:
+            session_id: New session ID
+            case_input: Parsed case information
+            similar_cases: Similar cases for reference
+
+        Yields:
+            StreamEvent objects for each stage of the deliberation
+        """
+        logger.info(f"Generating streaming initial opinions for session {session_id}")
+
+        deliberation_order = [AgentId.STRICT, AgentId.HUMANIST, AgentId.HISTORIAN]
+        accumulated_messages: list[DeliberationMessage] = []
+
+        for i, agent_id in enumerate(deliberation_order):
+            agent = self.agents[agent_id]
+
+            # Signal agent is starting
+            yield StreamEvent(
+                event_type="agent_start",
+                agent_id=agent_id,
+            )
+
+            full_content = ""
+            message_id = ""
+
+            try:
+                if i == 0:
+                    # First judge opens - use initial opinion prompt
+                    prompt = (
+                        "Anda membuka musyawarah majelis hakim ini. Sampaikan penilaian "
+                        f"awal Anda dari perspektif sebagai {agent.agent_name}.\n\n"
+                        "Pernyataan pembuka Anda harus:\n"
+                        "1. Merumuskan pertanyaan hukum utama di hadapan majelis\n"
+                        "2. Menyatakan posisi awal Anda mengenai putusan\n"
+                        "3. Mengidentifikasi pertimbangan hukum terpenting\n"
+                        "4. Mengundang diskusi dari rekan hakim mengenai poin-poin tertentu\n\n"
+                        "Berbicara secara alami seolah-olah menyapa majelis secara langsung. "
+                        "Akhiri dengan pertanyaan atau poin yang mengundang tanggapan."
+                    )
+
+                    async for chunk in agent.generate_response_stream(
+                        session_id=session_id,
+                        case_input=case_input,
+                        similar_cases=similar_cases,
+                        history=[],
+                        user_message=prompt,
+                    ):
+                        message_id = chunk.message_id or message_id
+                        if not chunk.is_complete:
+                            full_content += chunk.content
+                            yield StreamEvent(
+                                event_type="chunk",
+                                agent_id=agent_id,
+                                content=chunk.content,
+                                message_id=message_id,
+                            )
+                else:
+                    # Subsequent judges respond to prior discussion
+                    other_opinions = agent._summarize_prior_opinions(accumulated_messages)
+                    prompt = (
+                        f"Musyawarah telah dimulai. Berikut pendapat rekan-rekan hakim Anda:\n\n"
+                        f"{other_opinions}\n\n"
+                        f"Sebagai {agent.agent_name}, tanggapi diskusi ini:\n"
+                        "1. Akui poin-poin spesifik yang dikemukakan rekan hakim (setuju atau tidak setuju)\n"
+                        "2. Tambahkan perspektif unik Anda berdasarkan filosofi yudisial Anda\n"
+                        "3. Tunjukkan hal-hal yang mungkin terlewatkan oleh rekan hakim lain\n"
+                        "4. Jika Anda tidak setuju dengan hakim lain, jelaskan alasannya dengan hormat\n"
+                        "5. Ajukan pertimbangan baru atau pertanyaan untuk diskusi lebih lanjut\n\n"
+                        "Sapa rekan-rekan Anda secara langsung dan terlibat dengan penalaran mereka."
+                    )
+
+                    async for chunk in agent.generate_response_stream(
+                        session_id=session_id,
+                        case_input=case_input,
+                        similar_cases=similar_cases,
+                        history=accumulated_messages,
+                        user_message=prompt,
+                    ):
+                        message_id = chunk.message_id or message_id
+                        if not chunk.is_complete:
+                            full_content += chunk.content
+                            yield StreamEvent(
+                                event_type="chunk",
+                                agent_id=agent_id,
+                                content=chunk.content,
+                                message_id=message_id,
+                            )
+
+                # Create and accumulate the message
+                message = agent.create_message_from_stream(
+                    session_id=session_id,
+                    message_id=message_id,
+                    full_content=full_content,
+                )
+                accumulated_messages.append(message)
+
+                # Signal agent completion
+                yield StreamEvent(
+                    event_type="agent_complete",
+                    agent_id=agent_id,
+                    message_id=message_id,
+                    full_content=full_content,
+                )
+
+            except Exception as e:
+                logger.error(f"Agent {agent_id.value} streaming failed: {e}")
+                yield StreamEvent(
+                    event_type="agent_error",
+                    agent_id=agent_id,
+                    content=str(e),
+                )
+
+        # Signal deliberation complete
+        yield StreamEvent(event_type="deliberation_complete")
+
+    async def process_user_message_stream(
+        self,
+        session_id: str,
+        user_message: str,
+        case_input: ParsedCaseInput,
+        similar_cases: list[SimilarCase],
+        history: list[DeliberationMessage],
+        target_agent: str | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """
+        Process a user message and stream agent responses.
+
+        Args:
+            session_id: Current session ID
+            user_message: User's message content
+            case_input: Parsed case information
+            similar_cases: Similar cases for reference
+            history: Previous deliberation messages
+            target_agent: Specific agent to target (or "all")
+
+        Yields:
+            StreamEvent objects for the user message and agent responses
+        """
+        # Create user message
+        intent = self.classify_intent(user_message)
+        user_msg = DeliberationMessage(
+            id=str(uuid4()),
+            session_id=session_id,
+            sender=UserSender(),
+            content=user_message,
+            intent=intent.value,
+        )
+
+        # Emit user message event
+        yield StreamEvent(
+            event_type="user_message",
+            content=user_message,
+            message_id=user_msg.id,
+        )
+
+        # Determine response order
+        responders = self.determine_response_order(
+            message=user_message,
+            target_agent=target_agent,
+            history=history,
+        )
+
+        logger.info(
+            f"Streaming response for session {session_id}: "
+            f"intent={intent.value}, responders={[r.value for r in responders]}"
+        )
+
+        updated_history = history + [user_msg]
+
+        for agent_id in responders:
+            agent = self.agents[agent_id]
+
+            yield StreamEvent(
+                event_type="agent_start",
+                agent_id=agent_id,
+            )
+
+            full_content = ""
+            message_id = ""
+
+            try:
+                async for chunk in agent.generate_response_stream(
+                    session_id=session_id,
+                    case_input=case_input,
+                    similar_cases=similar_cases,
+                    history=updated_history,
+                    user_message=user_message if agent_id == responders[0] else None,
+                ):
+                    message_id = chunk.message_id or message_id
+                    if not chunk.is_complete:
+                        full_content += chunk.content
+                        yield StreamEvent(
+                            event_type="chunk",
+                            agent_id=agent_id,
+                            content=chunk.content,
+                            message_id=message_id,
+                        )
+
+                # Create message and add to history
+                message = agent.create_message_from_stream(
+                    session_id=session_id,
+                    message_id=message_id,
+                    full_content=full_content,
+                )
+                updated_history.append(message)
+
+                yield StreamEvent(
+                    event_type="agent_complete",
+                    agent_id=agent_id,
+                    message_id=message_id,
+                    full_content=full_content,
+                )
+
+            except Exception as e:
+                logger.error(f"Agent {agent_id.value} streaming failed: {e}")
+                yield StreamEvent(
+                    event_type="agent_error",
+                    agent_id=agent_id,
+                    content=str(e),
+                )
+
+        yield StreamEvent(event_type="deliberation_complete")
+
+    async def continue_discussion_stream(
+        self,
+        session_id: str,
+        case_input: ParsedCaseInput,
+        similar_cases: list[SimilarCase],
+        history: list[DeliberationMessage],
+        num_rounds: int = 1,
+    ) -> AsyncIterator[StreamEvent]:
+        """
+        Continue the judicial discussion with streaming responses.
+
+        Args:
+            session_id: Current session ID
+            case_input: Parsed case information
+            similar_cases: Similar cases for reference
+            history: Full message history so far
+            num_rounds: Number of discussion rounds
+
+        Yields:
+            StreamEvent objects for the continued discussion
+        """
+        logger.info(
+            f"Streaming continued discussion for session {session_id}, "
+            f"{num_rounds} round(s)"
+        )
+
+        current_history = list(history)
+
+        for round_num in range(num_rounds):
+            speaker_order = self._get_discussion_order(current_history)
+
+            for agent_id in speaker_order:
+                agent = self.agents[agent_id]
+
+                yield StreamEvent(
+                    event_type="agent_start",
+                    agent_id=agent_id,
+                )
+
+                full_content = ""
+                message_id = ""
+
+                # Build continuation prompt
+                other_opinions = agent._summarize_prior_opinions(current_history[-6:])
+                prompt = (
+                    f"Diskusi berlanjut. Musyawarah terkini:\n\n"
+                    f"{other_opinions}\n\n"
+                    f"Sebagai {agent.agent_name}, berkontribusi pada diskusi yang sedang berlangsung:\n"
+                    "- Tanggapi poin-poin baru yang diangkat oleh rekan hakim lain\n"
+                    "- Bangun di atas area kesepakatan yang mulai terbentuk\n"
+                    "- Klarifikasi atau pertahankan posisi Anda jika ditantang\n"
+                    "- Arahkan diskusi menuju penyelesaian jika memungkinkan\n\n"
+                    "Jaga agar tanggapan Anda tetap fokus untuk memajukan musyawarah."
+                )
+
+                try:
+                    async for chunk in agent.generate_response_stream(
+                        session_id=session_id,
+                        case_input=case_input,
+                        similar_cases=similar_cases,
+                        history=current_history,
+                        user_message=prompt,
+                    ):
+                        message_id = chunk.message_id or message_id
+                        if not chunk.is_complete:
+                            full_content += chunk.content
+                            yield StreamEvent(
+                                event_type="chunk",
+                                agent_id=agent_id,
+                                content=chunk.content,
+                                message_id=message_id,
+                            )
+
+                    message = agent.create_message_from_stream(
+                        session_id=session_id,
+                        message_id=message_id,
+                        full_content=full_content,
+                    )
+                    current_history.append(message)
+
+                    yield StreamEvent(
+                        event_type="agent_complete",
+                        agent_id=agent_id,
+                        message_id=message_id,
+                        full_content=full_content,
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        f"Agent {agent_id.value} streaming failed in round "
+                        f"{round_num + 1}: {e}"
+                    )
+                    yield StreamEvent(
+                        event_type="agent_error",
+                        agent_id=agent_id,
+                        content=str(e),
+                    )
+
+        yield StreamEvent(event_type="deliberation_complete")
 
 
 # =============================================================================

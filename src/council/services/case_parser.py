@@ -180,9 +180,7 @@ class CaseParserService:
                     f"Substance type: {structured_data.substance_type}"
                 )
             if structured_data.weight_grams:
-                context_parts.append(
-                    f"Weight: {structured_data.weight_grams} grams"
-                )
+                context_parts.append(f"Weight: {structured_data.weight_grams} grams")
             if structured_data.state_loss_idr:
                 context_parts.append(
                     f"State loss: Rp {structured_data.state_loss_idr:,.0f}"

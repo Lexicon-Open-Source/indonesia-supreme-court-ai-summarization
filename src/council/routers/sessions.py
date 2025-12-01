@@ -94,36 +94,35 @@ async def create_session(
         limit=5,
     )
 
-    # Create session
+    # Create session (now async)
     store = get_session_store()
-    session = store.create_session(case_input=case_input)
-    store.set_similar_cases(session.id, similar_cases)
+    session = await store.create_session(case_input=case_input)
+    await store.set_similar_cases(session.id, similar_cases)
 
-    # Generate initial opinions from all agents
+    # Generate initial opinion from a randomly selected judge
+    # This makes session creation faster (~5s instead of ~15s)
+    # Users can use /stream/initial or /stream/continue for full deliberation
     orchestrator = get_agent_orchestrator()
     try:
-        initial_messages = await orchestrator.generate_initial_opinions(
+        initial_message = await orchestrator.generate_random_initial_opinion(
             session_id=session.id,
             case_input=case_input.parsed_case,
             similar_cases=similar_cases,
         )
     except Exception as e:
-        logger.error(f"Failed to generate initial opinions: {e}")
-        # Still create session, just without initial messages
-        initial_messages = []
+        logger.error(f"Failed to generate initial opinion: {e}")
+        # Still create session, just without initial message
+        initial_message = None
 
-    # Add messages to session
-    if initial_messages:
-        store.add_messages(session.id, initial_messages)
-
-    # Return response with first message (usually the strict judge)
-    first_message = initial_messages[0] if initial_messages else None
+    # Add message to session (now async)
+    if initial_message:
+        await store.add_message(session.id, initial_message)
 
     return CreateSessionResponse(
         session_id=session.id,
         parsed_case=case_input.parsed_case,
         similar_cases=similar_cases,
-        initial_message=first_message,
+        initial_message=initial_message,
     )
 
 
@@ -136,7 +135,7 @@ async def get_session(session_id: str) -> GetSessionResponse:
     and all messages exchanged so far.
     """
     store = get_session_store()
-    session = store.get_session(session_id)
+    session = await store.get_session(session_id)
 
     if not session:
         raise HTTPException(
@@ -159,15 +158,14 @@ async def list_sessions(
     Supports filtering by status and pagination.
     """
     store = get_session_store()
-    sessions = store.list_sessions(
+    sessions = await store.list_sessions(
         status=status,
         limit=limit,
         offset=offset,
     )
 
-    # Get total count
-    all_sessions = store.list_sessions(status=status, limit=1000, offset=0)
-    total = len(all_sessions)
+    # Get total count using dedicated method
+    total = await store.count_sessions(status=status)
 
     return ListSessionsResponse(
         sessions=sessions,
@@ -188,13 +186,13 @@ async def delete_session(session_id: str) -> dict:
     """
     store = get_session_store()
 
-    if not store.get_session(session_id):
+    if not await store.get_session(session_id):
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
             detail=f"Session not found: {session_id}",
         )
 
-    store.delete_session(session_id)
+    await store.delete_session(session_id)
     return {"message": f"Session {session_id} deleted"}
 
 
@@ -208,7 +206,7 @@ async def conclude_session(session_id: str) -> GetSessionResponse:
     """
     store = get_session_store()
 
-    session = store.get_session(session_id)
+    session = await store.get_session(session_id)
     if not session:
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
@@ -221,5 +219,5 @@ async def conclude_session(session_id: str) -> GetSessionResponse:
             detail="Session is already concluded",
         )
 
-    concluded = store.conclude_session(session_id)
+    concluded = await store.conclude_session(session_id)
     return GetSessionResponse(session=concluded)

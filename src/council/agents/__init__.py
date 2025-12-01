@@ -7,14 +7,16 @@ Provides three distinct judicial personas:
 - HistorianAgent: Provides historical context and precedent analysis
 """
 
-from src.council.agents.base import BaseJudgeAgent
+from src.council.agents.base import BaseJudgeAgent, StreamChunk
 from src.council.agents.historian import HistorianAgent
 from src.council.agents.humanist import HumanistAgent
-from src.council.agents.orchestrator import AgentOrchestrator
+from src.council.agents.orchestrator import AgentOrchestrator, StreamEvent
 from src.council.agents.strict import StrictConstructionistAgent
 
 __all__ = [
     "BaseJudgeAgent",
+    "StreamChunk",
+    "StreamEvent",
     "StrictConstructionistAgent",
     "HumanistAgent",
     "HistorianAgent",
