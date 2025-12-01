@@ -45,7 +45,9 @@ OPINION_SCHEMA = {
     "properties": {
         "case_summary": {
             "type": "string",
-            "description": "Summary of the case being decided",
+            "description": (
+                "Summary of the case being decided (in Bahasa Indonesia)"
+            ),
         },
         "verdict_recommendation": {
             "type": "object",
@@ -59,7 +61,10 @@ OPINION_SCHEMA = {
                     "type": "string",
                     "enum": ["high", "medium", "low"],
                 },
-                "reasoning": {"type": "string"},
+                "reasoning": {
+                    "type": "string",
+                    "description": "Reasoning in Bahasa Indonesia",
+                },
             },
         },
         "sentence_recommendation": {
@@ -96,7 +101,12 @@ OPINION_SCHEMA = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "argument": {"type": "string"},
+                            "argument": {
+                                "type": "string",
+                                "description": (
+                                    "Legal argument in Bahasa Indonesia"
+                                ),
+                            },
                             "source_agent": {"type": "string"},
                             "supporting_cases": {
                                 "type": "array",
@@ -114,7 +124,12 @@ OPINION_SCHEMA = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "argument": {"type": "string"},
+                            "argument": {
+                                "type": "string",
+                                "description": (
+                                    "Legal argument in Bahasa Indonesia"
+                                ),
+                            },
                             "source_agent": {"type": "string"},
                             "supporting_cases": {
                                 "type": "array",
@@ -129,7 +144,12 @@ OPINION_SCHEMA = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "argument": {"type": "string"},
+                            "argument": {
+                                "type": "string",
+                                "description": (
+                                    "Legal argument in Bahasa Indonesia"
+                                ),
+                            },
                             "source_agent": {"type": "string"},
                             "supporting_cases": {
                                 "type": "array",
@@ -148,9 +168,18 @@ OPINION_SCHEMA = {
                 "properties": {
                     "case_id": {"type": "string"},
                     "case_number": {"type": "string"},
-                    "relevance": {"type": "string"},
-                    "verdict_summary": {"type": "string"},
-                    "how_it_applies": {"type": "string"},
+                    "relevance": {
+                        "type": "string",
+                        "description": "Relevance in Bahasa Indonesia",
+                    },
+                    "verdict_summary": {
+                        "type": "string",
+                        "description": "Summary in Bahasa Indonesia",
+                    },
+                    "how_it_applies": {
+                        "type": "string",
+                        "description": "Application in Bahasa Indonesia",
+                    },
                 },
             },
         },
@@ -160,20 +189,31 @@ OPINION_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "law_reference": {"type": "string"},
-                    "description": {"type": "string"},
-                    "how_it_applies": {"type": "string"},
+                    "description": {
+                        "type": "string",
+                        "description": "Description in Bahasa Indonesia",
+                    },
+                    "how_it_applies": {
+                        "type": "string",
+                        "description": "Application in Bahasa Indonesia",
+                    },
                 },
             },
         },
         "dissenting_views": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {
+                "type": "string",
+                "description": "Dissenting view in Bahasa Indonesia",
+            },
         },
     },
 }
 
 
 OPINION_GENERATION_PROMPT = """You are synthesizing a legal opinion from a judicial council deliberation.
+
+IMPORTANT: Generate the entire opinion in Bahasa Indonesia (Indonesian language).
 
 CASE INFORMATION:
 {case_info}
@@ -184,8 +224,9 @@ SIMILAR PRECEDENT CASES:
 DELIBERATION TRANSCRIPT:
 {deliberation_transcript}
 
-Based on the deliberation between the three judges (Strict Constructionist, Humanist, and Historian),
-generate a comprehensive legal opinion that:
+Based on the deliberation between the three judges (Strict
+Constructionist, Humanist, and Historian), generate a comprehensive
+legal opinion in Bahasa Indonesia that:
 
 1. VERDICT RECOMMENDATION:
    - Synthesize the consensus or majority view on verdict
