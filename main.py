@@ -29,6 +29,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from settings import QueueBackendType, _temp_credentials_file, get_settings
+from src.council import council_router
+from src.council import set_db_engine as set_council_db_engine
 from src.embedding import (
     SearchResult,
     ensure_pgvector_extension,
@@ -559,6 +561,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     )
     logger.info("Stale record recovery task started")
 
+    # Initialize council feature with database engine
+    set_council_db_engine(app_state.crawler_db_engine)
+    logger.info("Virtual Judicial Council initialized")
+
     logger.info("Startup complete")
     yield
 
@@ -596,6 +602,13 @@ app = FastAPI(
     "decisions",
     version="3.0.0",
     lifespan=lifespan,
+)
+
+# Include the Virtual Judicial Council router
+app.include_router(
+    council_router,
+    prefix="/council",
+    tags=["Virtual Judicial Council"],
 )
 
 
