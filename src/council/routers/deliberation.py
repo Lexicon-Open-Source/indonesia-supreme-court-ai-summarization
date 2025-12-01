@@ -297,7 +297,7 @@ async def generate_opinion(
         )
 
     # Store opinion in session
-    session.legal_opinion = opinion.model_dump()
+    session.legal_opinion = opinion.model_dump(mode="json")
     await store.update_session(session)
 
     return GenerateOpinionResponse(opinion=opinion)
